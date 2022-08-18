@@ -462,7 +462,9 @@ inline __device__ uint8_t* VlqEncode(uint8_t* p, uint32_t v)
 /**
  * @brief Pack literal values in output bitstream (1,2,3,4,5,6,8,10,12,16,20 or 24 bits per value)
  */
-inline __device__ void PackLiteralsShuffle(
+// bit widths that lie on easy boundaries can be handled either directly
+// (8, 16, 24) or through fast shuffle operations.
+inline __device__ void PackLiterals(
   uint8_t* dst, uint32_t v, uint32_t count, uint32_t w, uint32_t t)
 {
   constexpr uint32_t MASK2T = 1;  // mask for 2 thread leader
@@ -774,6 +776,8 @@ inline __device__ void PackLiteralsShuffle(
 /**
  * @brief Pack literals of arbitrary bit-length in output bitstream.
  */
+// less efficient bit packing that uses atomics, but can handle arbitrary
+// bit widths up to 16. used for repetition and definition level encoding
 inline __device__ void PackLiteralsRoundRobin(
   uint8_t* dst, uint32_t v, uint32_t count, uint32_t w, uint32_t t)
 {
@@ -809,47 +813,6 @@ inline __device__ void PackLiteralsRoundRobin(
   // would need the following for up to 24 bits
   // if (t + 256 < available_bytes) { dst[t + 256] = scratch_bytes[t + 256]; }
   __syncthreads();
-}
-
-/**
- * @brief Pack literal values in output bitstream
- */
-inline __device__ void PackLiterals(
-  uint8_t* dst, uint32_t v, uint32_t count, uint32_t w, uint32_t t)
-{
-  switch (w) {
-    case 1:
-    case 2:
-    case 3:
-    case 4:
-    case 5:
-    case 6:
-    case 7:
-    case 8:
-    case 9:
-    case 10:
-    case 11:
-    case 12:
-    case 13:
-    case 14:
-    case 15:
-    case 16:
-    case 17:
-    case 18:
-    case 19:
-    case 20:
-    case 22:
-    case 24:
-      // bit widths that lie on easy boundaries can be handled either directly
-      // (8, 16, 24) or through fast shuffle operations.
-      PackLiteralsShuffle(dst, v, count, w, t);
-      break;
-    default:
-      if (w > 16) { CUDF_UNREACHABLE("Unsupported bit width"); }
-      // less efficient bit packing that uses atomics, but can handle arbitrary
-      // bit widths up to 16. used for repetition and definition level encoding
-      PackLiteralsRoundRobin(dst, v, count, w, t);
-  }
 }
 
 /**
