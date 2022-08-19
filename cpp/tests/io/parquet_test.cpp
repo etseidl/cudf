@@ -396,7 +396,7 @@ INSTANTIATE_TEST_SUITE_P(ParquetDictionaryTest,
 
 INSTANTIATE_TEST_SUITE_P(ParquetDictionaryTest,
                          ParquetSizedTestXL,
-                         testing::Values(22, 24),
+                         testing::Values(21, 22, 23, 24),
                          testing::PrintToStringParamName());
 
 namespace {
@@ -4293,8 +4293,8 @@ TEST_P(ParquetSizedTest, DictionaryTest)
 
 TEST_P(ParquetSizedTestXL, DictionaryTestXL)
 {
-  constexpr int nrows   = 10'000'000;
-  const int cardinality = (1 << (GetParam() - 1)) + 1;
+  const unsigned int cardinality = (1 << (GetParam() - 1)) + 1;
+  const unsigned int nrows = cardinality * 3 / 2;
 
   auto elements       = cudf::detail::make_counting_transform_iterator(0, [cardinality](auto i) {
     return "a unique string value suffixed with " + std::to_string(i % cardinality);

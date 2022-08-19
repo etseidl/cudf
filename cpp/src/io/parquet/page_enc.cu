@@ -460,320 +460,6 @@ inline __device__ uint8_t* VlqEncode(uint8_t* p, uint32_t v)
 }
 
 /**
- * @brief Pack literal values in output bitstream (1,2,3,4,5,6,8,10,12,16,20 or 24 bits per value)
- */
-// bit widths that lie on easy boundaries can be handled either directly
-// (8, 16, 24) or through fast shuffle operations.
-inline __device__ void PackLiterals(
-  uint8_t* dst, uint32_t v, uint32_t count, uint32_t w, uint32_t t)
-{
-  constexpr uint32_t MASK2T = 1;  // mask for 2 thread leader
-  constexpr uint32_t MASK4T = 3;  // mask for 4 thread leader
-  constexpr uint32_t MASK8T = 7;  // mask for 8 thread leader
-  uint64_t v64;
-  __uint128_t v128;
-
-  if (t > (count | 0x1f)) { return; }
-
-  switch (w) {
-    case 1:
-      v |= shuffle_xor(v, 1) << 1;
-      v |= shuffle_xor(v, 2) << 2;
-      v |= shuffle_xor(v, 4) << 4;
-      if (t < count && !(t & MASK8T)) { dst[(t * w) >> 3] = v; }
-      return;
-    case 2:
-      v |= shuffle_xor(v, 1) << 2;
-      v |= shuffle_xor(v, 2) << 4;
-      if (t < count && !(t & MASK4T)) { dst[(t * w) >> 3] = v; }
-      return;
-    case 3:
-      v |= shuffle_xor(v, 1) << 3;
-      v |= shuffle_xor(v, 2) << 6;
-      v |= shuffle_xor(v, 4) << 12;
-      if (t < count && !(t & MASK8T)) {
-        dst[(t >> 3) * 3 + 0] = v;
-        dst[(t >> 3) * 3 + 1] = v >> 8;
-        dst[(t >> 3) * 3 + 2] = v >> 16;
-      }
-      return;
-    case 4:
-      v |= shuffle_xor(v, 1) << 4;
-      if (t < count && !(t & MASK2T)) { dst[(t * w) >> 3] = v; }
-      return;
-    case 5:
-      v |= shuffle_xor(v, 1) << 5;
-      v |= shuffle_xor(v, 2) << 10;
-      v64 = static_cast<uint64_t>(shuffle_xor(v, 4)) << 20 | v;
-      if (t < count && !(t & MASK8T)) {
-        dst[(t >> 3) * 5 + 0] = v64;
-        dst[(t >> 3) * 5 + 1] = v64 >> 8;
-        dst[(t >> 3) * 5 + 2] = v64 >> 16;
-        dst[(t >> 3) * 5 + 3] = v64 >> 24;
-        dst[(t >> 3) * 5 + 4] = v64 >> 32;
-      }
-      return;
-    case 6:
-      v |= shuffle_xor(v, 1) << 6;
-      v |= shuffle_xor(v, 2) << 12;
-      if (t < count && !(t & MASK4T)) {
-        dst[(t >> 2) * 3 + 0] = v;
-        dst[(t >> 2) * 3 + 1] = v >> 8;
-        dst[(t >> 2) * 3 + 2] = v >> 16;
-      }
-      return;
-    case 7:
-      v |= shuffle_xor(v, 1) << 7;
-      v |= shuffle_xor(v, 2) << 14;
-      v64 = static_cast<uint64_t>(shuffle_xor(v, 4)) << 28 | v;
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 7), &v64, 7);
-        dst[(t >> 3) * 7 + 0] = v64;
-        dst[(t >> 3) * 7 + 1] = v64 >> 8;
-        dst[(t >> 3) * 7 + 2] = v64 >> 16;
-        dst[(t >> 3) * 7 + 3] = v64 >> 24;
-        dst[(t >> 3) * 7 + 4] = v64 >> 32;
-        dst[(t >> 3) * 7 + 5] = v64 >> 40;
-        dst[(t >> 3) * 7 + 6] = v64 >> 48;
-      }
-      return;
-    case 8:
-      if (t < count) { dst[t] = v; }
-      return;
-    case 9:
-      v |= shuffle_xor(v, 1) << 9;
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 18 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 36 | v64;
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 9), &v128, 9);
-        dst[(t >> 3) * 9 + 0] = v128;
-        dst[(t >> 3) * 9 + 1] = v128 >> 8;
-        dst[(t >> 3) * 9 + 2] = v128 >> 16;
-        dst[(t >> 3) * 9 + 3] = v128 >> 24;
-        dst[(t >> 3) * 9 + 4] = v128 >> 32;
-        dst[(t >> 3) * 9 + 5] = v128 >> 40;
-        dst[(t >> 3) * 9 + 6] = v128 >> 48;
-        dst[(t >> 3) * 9 + 7] = v128 >> 56;
-        dst[(t >> 3) * 9 + 8] = v128 >> 64;
-      }
-      return;
-    case 10:
-      v |= shuffle_xor(v, 1) << 10;
-      v64 = static_cast<uint64_t>(shuffle_xor(v, 2)) << 20 | v;
-      if (t < count && !(t & MASK4T)) {
-        dst[(t >> 2) * 5 + 0] = v64;
-        dst[(t >> 2) * 5 + 1] = v64 >> 8;
-        dst[(t >> 2) * 5 + 2] = v64 >> 16;
-        dst[(t >> 2) * 5 + 3] = v64 >> 24;
-        dst[(t >> 2) * 5 + 4] = v64 >> 32;
-      }
-      return;
-    case 11:
-      v |= shuffle_xor(v, 1) << 11;
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 22 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 44 | v64;
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 11), &v64, 11);
-        dst[(t >> 3) * 11 + 0]  = v128;
-        dst[(t >> 3) * 11 + 1]  = v128 >> 8;
-        dst[(t >> 3) * 11 + 2]  = v128 >> 16;
-        dst[(t >> 3) * 11 + 3]  = v128 >> 24;
-        dst[(t >> 3) * 11 + 4]  = v128 >> 32;
-        dst[(t >> 3) * 11 + 5]  = v128 >> 40;
-        dst[(t >> 3) * 11 + 6]  = v128 >> 48;
-        dst[(t >> 3) * 11 + 7]  = v128 >> 56;
-        dst[(t >> 3) * 11 + 8]  = v128 >> 64;
-        dst[(t >> 3) * 11 + 9]  = v128 >> 72;
-        dst[(t >> 3) * 11 + 10] = v128 >> 80;
-      }
-      return;
-    case 12:
-      v |= shuffle_xor(v, 1) << 12;
-      if (t < count && !(t & MASK2T)) {
-        dst[(t >> 1) * 3 + 0] = v;
-        dst[(t >> 1) * 3 + 1] = v >> 8;
-        dst[(t >> 1) * 3 + 2] = v >> 16;
-      }
-      return;
-    case 13:
-      v |= shuffle_xor(v, 1) << 13;
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 26 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 52 | v64;
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 13), &v64, 13);
-        dst[(t >> 3) * 13 + 0]  = v128;
-        dst[(t >> 3) * 13 + 1]  = v128 >> 8;
-        dst[(t >> 3) * 13 + 2]  = v128 >> 16;
-        dst[(t >> 3) * 13 + 3]  = v128 >> 24;
-        dst[(t >> 3) * 13 + 4]  = v128 >> 32;
-        dst[(t >> 3) * 13 + 5]  = v128 >> 40;
-        dst[(t >> 3) * 13 + 6]  = v128 >> 48;
-        dst[(t >> 3) * 13 + 7]  = v128 >> 56;
-        dst[(t >> 3) * 13 + 8]  = v128 >> 64;
-        dst[(t >> 3) * 13 + 9]  = v128 >> 72;
-        dst[(t >> 3) * 13 + 10] = v128 >> 80;
-        dst[(t >> 3) * 13 + 11] = v128 >> 88;
-        dst[(t >> 3) * 13 + 12] = v128 >> 96;
-      }
-      return;
-    case 14:
-      v |= shuffle_xor(v, 1) << 14;
-      v64 = static_cast<uint64_t>(shuffle_xor(v, 2)) << 28 | v;
-      if (t < count && !(t & MASK4T)) {
-        // memcpy(dst + ((t >> 2) * 7), &v64, 7);
-        dst[(t >> 2) * 7 + 0] = v64;
-        dst[(t >> 2) * 7 + 1] = v64 >> 8;
-        dst[(t >> 2) * 7 + 2] = v64 >> 16;
-        dst[(t >> 2) * 7 + 3] = v64 >> 24;
-        dst[(t >> 2) * 7 + 4] = v64 >> 32;
-        dst[(t >> 2) * 7 + 5] = v64 >> 40;
-        dst[(t >> 2) * 7 + 6] = v64 >> 48;
-      }
-      return;
-    case 15:
-      v |= shuffle_xor(v, 1) << 15;
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 30 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 60 | v64;
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 15), &v64, 15);
-        dst[(t >> 3) * 15 + 0]  = v128;
-        dst[(t >> 3) * 15 + 1]  = v128 >> 8;
-        dst[(t >> 3) * 15 + 2]  = v128 >> 16;
-        dst[(t >> 3) * 15 + 3]  = v128 >> 24;
-        dst[(t >> 3) * 15 + 4]  = v128 >> 32;
-        dst[(t >> 3) * 15 + 5]  = v128 >> 40;
-        dst[(t >> 3) * 15 + 6]  = v128 >> 48;
-        dst[(t >> 3) * 15 + 7]  = v128 >> 56;
-        dst[(t >> 3) * 15 + 8]  = v128 >> 64;
-        dst[(t >> 3) * 15 + 9]  = v128 >> 72;
-        dst[(t >> 3) * 15 + 10] = v128 >> 80;
-        dst[(t >> 3) * 15 + 11] = v128 >> 88;
-        dst[(t >> 3) * 15 + 12] = v128 >> 96;
-        dst[(t >> 3) * 15 + 13] = v128 >> 104;
-        dst[(t >> 3) * 15 + 14] = v128 >> 112;
-      }
-      return;
-    case 16:
-      if (t < count) {
-        dst[t * 2 + 0] = v;
-        dst[t * 2 + 1] = v >> 8;
-      }
-      return;
-    case 17:
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 17 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 34 | v64;
-      v64  = v128;        // get low 60
-      v    = v128 >> 60;  // save high 8 bits
-      v128 |= static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 68;
-      v = shuffle_xor(v, 4);
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 15), &v64, 15);
-        dst[(t >> 3) * 17 + 0]  = v128;
-        dst[(t >> 3) * 17 + 1]  = v128 >> 8;
-        dst[(t >> 3) * 17 + 2]  = v128 >> 16;
-        dst[(t >> 3) * 17 + 3]  = v128 >> 24;
-        dst[(t >> 3) * 17 + 4]  = v128 >> 32;
-        dst[(t >> 3) * 17 + 5]  = v128 >> 40;
-        dst[(t >> 3) * 17 + 6]  = v128 >> 48;
-        dst[(t >> 3) * 17 + 7]  = v128 >> 56;
-        dst[(t >> 3) * 17 + 8]  = v128 >> 64;
-        dst[(t >> 3) * 17 + 9]  = v128 >> 72;
-        dst[(t >> 3) * 17 + 10] = v128 >> 80;
-        dst[(t >> 3) * 17 + 11] = v128 >> 88;
-        dst[(t >> 3) * 17 + 12] = v128 >> 96;
-        dst[(t >> 3) * 17 + 13] = v128 >> 104;
-        dst[(t >> 3) * 17 + 14] = v128 >> 112;
-        dst[(t >> 3) * 17 + 15] = v128 >> 120;
-        dst[(t >> 3) * 17 + 16] = v;
-      }
-      return;
-    case 18:
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 18 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 36 | v64;
-      if (t < count && !(t & MASK4T)) {
-        // memcpy(dst + ((t >> 2) * 9), &v128, 9);
-        dst[(t >> 2) * 9 + 0] = v128;
-        dst[(t >> 2) * 9 + 1] = v128 >> 8;
-        dst[(t >> 2) * 9 + 2] = v128 >> 16;
-        dst[(t >> 2) * 9 + 3] = v128 >> 24;
-        dst[(t >> 2) * 9 + 4] = v128 >> 32;
-        dst[(t >> 2) * 9 + 5] = v128 >> 40;
-        dst[(t >> 2) * 9 + 6] = v128 >> 48;
-        dst[(t >> 2) * 9 + 7] = v128 >> 56;
-        dst[(t >> 2) * 9 + 8] = v128 >> 64;
-      }
-      return;
-    case 19:
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 19 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 38 | v64;
-      v64  = v128;        // get low 52
-      v    = v128 >> 52;  // save high 24 bits
-      v128 |= static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 76;
-      v = shuffle_xor(v, 4);
-      if (t < count && !(t & MASK8T)) {
-        // memcpy(dst + ((t >> 3) * 15), &v64, 15);
-        dst[(t >> 3) * 19 + 0]  = v128;
-        dst[(t >> 3) * 19 + 1]  = v128 >> 8;
-        dst[(t >> 3) * 19 + 2]  = v128 >> 16;
-        dst[(t >> 3) * 19 + 3]  = v128 >> 24;
-        dst[(t >> 3) * 19 + 4]  = v128 >> 32;
-        dst[(t >> 3) * 19 + 5]  = v128 >> 40;
-        dst[(t >> 3) * 19 + 6]  = v128 >> 48;
-        dst[(t >> 3) * 19 + 7]  = v128 >> 56;
-        dst[(t >> 3) * 19 + 8]  = v128 >> 64;
-        dst[(t >> 3) * 19 + 9]  = v128 >> 72;
-        dst[(t >> 3) * 19 + 10] = v128 >> 80;
-        dst[(t >> 3) * 19 + 11] = v128 >> 88;
-        dst[(t >> 3) * 19 + 12] = v128 >> 96;
-        dst[(t >> 3) * 19 + 13] = v128 >> 104;
-        dst[(t >> 3) * 19 + 14] = v128 >> 112;
-        dst[(t >> 3) * 19 + 15] = v128 >> 120;
-        dst[(t >> 3) * 19 + 16] = v;
-        dst[(t >> 3) * 19 + 17] = v >> 8;
-        dst[(t >> 3) * 19 + 18] = v >> 16;
-      }
-      return;
-    case 20:
-      v64 = static_cast<uint64_t>(shuffle_xor(v, 1)) << 20 | v;
-      if (t < count && !(t & MASK2T)) {
-        dst[(t >> 1) * 5 + 0] = v64;
-        dst[(t >> 1) * 5 + 1] = v64 >> 8;
-        dst[(t >> 1) * 5 + 2] = v64 >> 16;
-        dst[(t >> 1) * 5 + 3] = v64 >> 24;
-        dst[(t >> 1) * 5 + 4] = v64 >> 32;
-      }
-      return;
-    case 22:
-      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 22 | v;
-      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 44 | v64;
-      if (t < count && !(t & MASK4T)) {
-        // memcpy(dst + ((t >> 2) * 11), &v64, 11);
-        dst[(t >> 2) * 11 + 0]  = v128;
-        dst[(t >> 2) * 11 + 1]  = v128 >> 8;
-        dst[(t >> 2) * 11 + 2]  = v128 >> 16;
-        dst[(t >> 2) * 11 + 3]  = v128 >> 24;
-        dst[(t >> 2) * 11 + 4]  = v128 >> 32;
-        dst[(t >> 2) * 11 + 5]  = v128 >> 40;
-        dst[(t >> 2) * 11 + 6]  = v128 >> 48;
-        dst[(t >> 2) * 11 + 7]  = v128 >> 56;
-        dst[(t >> 2) * 11 + 8]  = v128 >> 64;
-        dst[(t >> 2) * 11 + 9]  = v128 >> 72;
-        dst[(t >> 2) * 11 + 10] = v128 >> 80;
-      }
-      return;
-    case 24:
-      if (t < count) {
-        dst[t * 3 + 0] = v;
-        dst[t * 3 + 1] = v >> 8;
-        dst[t * 3 + 2] = v >> 16;
-      }
-      return;
-
-    default: CUDF_UNREACHABLE("Unsupported bit width");
-  }
-}
-
-/**
  * @brief Pack literals of arbitrary bit-length in output bitstream.
  */
 // less efficient bit packing that uses atomics, but can handle arbitrary
@@ -813,6 +499,359 @@ inline __device__ void PackLiteralsRoundRobin(
   // would need the following for up to 24 bits
   // if (t + 256 < available_bytes) { dst[t + 256] = scratch_bytes[t + 256]; }
   __syncthreads();
+}
+
+inline __device__ void PackLiteralsRoundRobin24(
+  uint8_t* dst, uint32_t v, uint32_t count, uint32_t w, uint32_t t)
+{
+  // Scratch space to temporarily write to. Needed because we will use atomics to write 32 bit
+  // words but the destination mem may not be a multiple of 4 bytes.
+  // TODO (dm): This assumes blockdim = 128 and max bits per value = 24. Reduce magic numbers.
+  __shared__ uint32_t scratch[96];
+  if (t < 96) { scratch[t] = 0; }
+  __syncthreads();
+
+  if (t <= count) {
+    union {
+      uint64_t v64;
+      uint32_t v32[0];
+    } bitfield;
+      
+    // shift symbol left by up to 31 bits
+    bitfield.v64 = v;
+    bitfield.v64 <<= (t * w) & 0x1f;
+
+    // Copy 64 bit word into two 32 bit words while following C++ strict aliasing rules.
+    //uint32_t v32[2];
+    //memcpy(&v32, &v64, sizeof(uint64_t));
+
+    // Atomically write result to scratch
+    if (bitfield.v32[0]) { atomicOr(scratch + ((t * w) >> 5), bitfield.v32[0]); }
+    if (bitfield.v32[1]) { atomicOr(scratch + ((t * w) >> 5) + 1, bitfield.v32[1]); }
+  }
+  __syncthreads();
+
+  // Copy scratch data to final destination
+  auto available_bytes = (count * w + 7) / 8;
+
+  auto scratch_bytes = reinterpret_cast<char*>(&scratch[0]);
+  if (t < available_bytes) { dst[t] = scratch_bytes[t]; }
+  if (t + 128 < available_bytes) { dst[t + 128] = scratch_bytes[t + 128]; }
+  if (t + 256 < available_bytes) { dst[t + 256] = scratch_bytes[t + 256]; }
+  __syncthreads();
+}
+/**
+ * @brief Pack literal values in output bitstream (1,2,3,4,5,6,8,10,12,16,20 or 24 bits per value)
+ */
+// bit widths that lie on easy boundaries can be handled either directly
+// (8, 16, 24) or through fast shuffle operations.
+inline __device__ void PackLiterals(
+  uint8_t* dst, uint32_t v, uint32_t count, uint32_t w, uint32_t t)
+{
+  constexpr uint32_t MASK2T = 1;  // mask for 2 thread leader
+  constexpr uint32_t MASK4T = 3;  // mask for 4 thread leader
+  constexpr uint32_t MASK8T = 7;  // mask for 8 thread leader
+  //uint64_t v64;
+  //__uint128_t v128;
+
+  if (not (w == 1 || w == 2 || w == 4 || w == 8 || w == 16 || w == 24)) {
+    PackLiteralsRoundRobin24(dst, v, count, w, t);
+    return;
+  }
+
+  if (t > (count | 0x1f)) { return; }
+
+  switch (w) {
+    case 1:
+      v |= shuffle_xor(v, 1) << 1;
+      v |= shuffle_xor(v, 2) << 2;
+      v |= shuffle_xor(v, 4) << 4;
+      if (t < count && !(t & MASK8T)) { dst[(t * w) >> 3] = v; }
+      return;
+    case 2:
+      v |= shuffle_xor(v, 1) << 2;
+      v |= shuffle_xor(v, 2) << 4;
+      if (t < count && !(t & MASK4T)) { dst[(t * w) >> 3] = v; }
+      return;
+    case 3:
+      v |= shuffle_xor(v, 1) << 3;
+      v |= shuffle_xor(v, 2) << 6;
+      v |= shuffle_xor(v, 4) << 12;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 3 + 0] = v;
+        dst[(t >> 3) * 3 + 1] = v >> 8;
+        dst[(t >> 3) * 3 + 2] = v >> 16;
+      }
+      return;
+    case 4:
+      v |= shuffle_xor(v, 1) << 4;
+      if (t < count && !(t & MASK2T)) { dst[(t * w) >> 3] = v; }
+      return;
+#if 0
+    case 5:
+      v |= shuffle_xor(v, 1) << 5;
+      v |= shuffle_xor(v, 2) << 10;
+      v64 = static_cast<uint64_t>(shuffle_xor(v, 4)) << 20 | v;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 5 + 0] = v64;
+        dst[(t >> 3) * 5 + 1] = v64 >> 8;
+        dst[(t >> 3) * 5 + 2] = v64 >> 16;
+        dst[(t >> 3) * 5 + 3] = v64 >> 24;
+        dst[(t >> 3) * 5 + 4] = v64 >> 32;
+      }
+      return;
+    case 6:
+      v |= shuffle_xor(v, 1) << 6;
+      v |= shuffle_xor(v, 2) << 12;
+      if (t < count && !(t & MASK4T)) {
+        dst[(t >> 2) * 3 + 0] = v;
+        dst[(t >> 2) * 3 + 1] = v >> 8;
+        dst[(t >> 2) * 3 + 2] = v >> 16;
+      }
+      return;
+    case 7:
+      v |= shuffle_xor(v, 1) << 7;
+      v |= shuffle_xor(v, 2) << 14;
+      v64 = static_cast<uint64_t>(shuffle_xor(v, 4)) << 28 | v;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 7 + 0] = v64;
+        dst[(t >> 3) * 7 + 1] = v64 >> 8;
+        dst[(t >> 3) * 7 + 2] = v64 >> 16;
+        dst[(t >> 3) * 7 + 3] = v64 >> 24;
+        dst[(t >> 3) * 7 + 4] = v64 >> 32;
+        dst[(t >> 3) * 7 + 5] = v64 >> 40;
+        dst[(t >> 3) * 7 + 6] = v64 >> 48;
+      }
+      return;
+#endif
+    case 8:
+      if (t < count) { dst[t] = v; }
+      return;
+#if 0
+    case 9:
+      v |= shuffle_xor(v, 1) << 9;
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 18 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 36 | v64;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 9 + 0] = v128;
+        dst[(t >> 3) * 9 + 1] = v128 >> 8;
+        dst[(t >> 3) * 9 + 2] = v128 >> 16;
+        dst[(t >> 3) * 9 + 3] = v128 >> 24;
+        dst[(t >> 3) * 9 + 4] = v128 >> 32;
+        dst[(t >> 3) * 9 + 5] = v128 >> 40;
+        dst[(t >> 3) * 9 + 6] = v128 >> 48;
+        dst[(t >> 3) * 9 + 7] = v128 >> 56;
+        dst[(t >> 3) * 9 + 8] = v128 >> 64;
+      }
+      return;
+    case 10:
+      v |= shuffle_xor(v, 1) << 10;
+      v64 = static_cast<uint64_t>(shuffle_xor(v, 2)) << 20 | v;
+      if (t < count && !(t & MASK4T)) {
+        dst[(t >> 2) * 5 + 0] = v64;
+        dst[(t >> 2) * 5 + 1] = v64 >> 8;
+        dst[(t >> 2) * 5 + 2] = v64 >> 16;
+        dst[(t >> 2) * 5 + 3] = v64 >> 24;
+        dst[(t >> 2) * 5 + 4] = v64 >> 32;
+      }
+      return;
+    case 11:
+      v |= shuffle_xor(v, 1) << 11;
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 22 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 44 | v64;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 11 + 0]  = v128;
+        dst[(t >> 3) * 11 + 1]  = v128 >> 8;
+        dst[(t >> 3) * 11 + 2]  = v128 >> 16;
+        dst[(t >> 3) * 11 + 3]  = v128 >> 24;
+        dst[(t >> 3) * 11 + 4]  = v128 >> 32;
+        dst[(t >> 3) * 11 + 5]  = v128 >> 40;
+        dst[(t >> 3) * 11 + 6]  = v128 >> 48;
+        dst[(t >> 3) * 11 + 7]  = v128 >> 56;
+        dst[(t >> 3) * 11 + 8]  = v128 >> 64;
+        dst[(t >> 3) * 11 + 9]  = v128 >> 72;
+        dst[(t >> 3) * 11 + 10] = v128 >> 80;
+      }
+      return;
+    case 12:
+      v |= shuffle_xor(v, 1) << 12;
+      if (t < count && !(t & MASK2T)) {
+        dst[(t >> 1) * 3 + 0] = v;
+        dst[(t >> 1) * 3 + 1] = v >> 8;
+        dst[(t >> 1) * 3 + 2] = v >> 16;
+      }
+      return;
+    case 13:
+      v |= shuffle_xor(v, 1) << 13;
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 26 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 52 | v64;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 13 + 0]  = v128;
+        dst[(t >> 3) * 13 + 1]  = v128 >> 8;
+        dst[(t >> 3) * 13 + 2]  = v128 >> 16;
+        dst[(t >> 3) * 13 + 3]  = v128 >> 24;
+        dst[(t >> 3) * 13 + 4]  = v128 >> 32;
+        dst[(t >> 3) * 13 + 5]  = v128 >> 40;
+        dst[(t >> 3) * 13 + 6]  = v128 >> 48;
+        dst[(t >> 3) * 13 + 7]  = v128 >> 56;
+        dst[(t >> 3) * 13 + 8]  = v128 >> 64;
+        dst[(t >> 3) * 13 + 9]  = v128 >> 72;
+        dst[(t >> 3) * 13 + 10] = v128 >> 80;
+        dst[(t >> 3) * 13 + 11] = v128 >> 88;
+        dst[(t >> 3) * 13 + 12] = v128 >> 96;
+      }
+      return;
+    case 14:
+      v |= shuffle_xor(v, 1) << 14;
+      v64 = static_cast<uint64_t>(shuffle_xor(v, 2)) << 28 | v;
+      if (t < count && !(t & MASK4T)) {
+        dst[(t >> 2) * 7 + 0] = v64;
+        dst[(t >> 2) * 7 + 1] = v64 >> 8;
+        dst[(t >> 2) * 7 + 2] = v64 >> 16;
+        dst[(t >> 2) * 7 + 3] = v64 >> 24;
+        dst[(t >> 2) * 7 + 4] = v64 >> 32;
+        dst[(t >> 2) * 7 + 5] = v64 >> 40;
+        dst[(t >> 2) * 7 + 6] = v64 >> 48;
+      }
+      return;
+    case 15:
+      v |= shuffle_xor(v, 1) << 15;
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 2)) << 30 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 60 | v64;
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 15 + 0]  = v128;
+        dst[(t >> 3) * 15 + 1]  = v128 >> 8;
+        dst[(t >> 3) * 15 + 2]  = v128 >> 16;
+        dst[(t >> 3) * 15 + 3]  = v128 >> 24;
+        dst[(t >> 3) * 15 + 4]  = v128 >> 32;
+        dst[(t >> 3) * 15 + 5]  = v128 >> 40;
+        dst[(t >> 3) * 15 + 6]  = v128 >> 48;
+        dst[(t >> 3) * 15 + 7]  = v128 >> 56;
+        dst[(t >> 3) * 15 + 8]  = v128 >> 64;
+        dst[(t >> 3) * 15 + 9]  = v128 >> 72;
+        dst[(t >> 3) * 15 + 10] = v128 >> 80;
+        dst[(t >> 3) * 15 + 11] = v128 >> 88;
+        dst[(t >> 3) * 15 + 12] = v128 >> 96;
+        dst[(t >> 3) * 15 + 13] = v128 >> 104;
+        dst[(t >> 3) * 15 + 14] = v128 >> 112;
+      }
+      return;
+#endif
+    case 16:
+      if (t < count) {
+        dst[t * 2 + 0] = v;
+        dst[t * 2 + 1] = v >> 8;
+      }
+      return;
+#if 0
+    case 17:
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 17 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 34 | v64;
+      v64  = v128;        // get low 60
+      v    = v128 >> 60;  // save high 8 bits
+      v128 |= static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 68;
+      v = shuffle_xor(v, 4);
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 17 + 0]  = v128;
+        dst[(t >> 3) * 17 + 1]  = v128 >> 8;
+        dst[(t >> 3) * 17 + 2]  = v128 >> 16;
+        dst[(t >> 3) * 17 + 3]  = v128 >> 24;
+        dst[(t >> 3) * 17 + 4]  = v128 >> 32;
+        dst[(t >> 3) * 17 + 5]  = v128 >> 40;
+        dst[(t >> 3) * 17 + 6]  = v128 >> 48;
+        dst[(t >> 3) * 17 + 7]  = v128 >> 56;
+        dst[(t >> 3) * 17 + 8]  = v128 >> 64;
+        dst[(t >> 3) * 17 + 9]  = v128 >> 72;
+        dst[(t >> 3) * 17 + 10] = v128 >> 80;
+        dst[(t >> 3) * 17 + 11] = v128 >> 88;
+        dst[(t >> 3) * 17 + 12] = v128 >> 96;
+        dst[(t >> 3) * 17 + 13] = v128 >> 104;
+        dst[(t >> 3) * 17 + 14] = v128 >> 112;
+        dst[(t >> 3) * 17 + 15] = v128 >> 120;
+        dst[(t >> 3) * 17 + 16] = v;
+      }
+      return;
+    case 18:
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 18 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 36 | v64;
+      if (t < count && !(t & MASK4T)) {
+        dst[(t >> 2) * 9 + 0] = v128;
+        dst[(t >> 2) * 9 + 1] = v128 >> 8;
+        dst[(t >> 2) * 9 + 2] = v128 >> 16;
+        dst[(t >> 2) * 9 + 3] = v128 >> 24;
+        dst[(t >> 2) * 9 + 4] = v128 >> 32;
+        dst[(t >> 2) * 9 + 5] = v128 >> 40;
+        dst[(t >> 2) * 9 + 6] = v128 >> 48;
+        dst[(t >> 2) * 9 + 7] = v128 >> 56;
+        dst[(t >> 2) * 9 + 8] = v128 >> 64;
+      }
+      return;
+    case 19:
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 19 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 38 | v64;
+      v64  = v128;        // get low 52
+      v    = v128 >> 52;  // save high 24 bits
+      v128 |= static_cast<__uint128_t>(shuffle_xor(v64, 4)) << 76;
+      v = shuffle_xor(v, 4);
+      if (t < count && !(t & MASK8T)) {
+        dst[(t >> 3) * 19 + 0]  = v128;
+        dst[(t >> 3) * 19 + 1]  = v128 >> 8;
+        dst[(t >> 3) * 19 + 2]  = v128 >> 16;
+        dst[(t >> 3) * 19 + 3]  = v128 >> 24;
+        dst[(t >> 3) * 19 + 4]  = v128 >> 32;
+        dst[(t >> 3) * 19 + 5]  = v128 >> 40;
+        dst[(t >> 3) * 19 + 6]  = v128 >> 48;
+        dst[(t >> 3) * 19 + 7]  = v128 >> 56;
+        dst[(t >> 3) * 19 + 8]  = v128 >> 64;
+        dst[(t >> 3) * 19 + 9]  = v128 >> 72;
+        dst[(t >> 3) * 19 + 10] = v128 >> 80;
+        dst[(t >> 3) * 19 + 11] = v128 >> 88;
+        dst[(t >> 3) * 19 + 12] = v128 >> 96;
+        dst[(t >> 3) * 19 + 13] = v128 >> 104;
+        dst[(t >> 3) * 19 + 14] = v128 >> 112;
+        dst[(t >> 3) * 19 + 15] = v128 >> 120;
+        dst[(t >> 3) * 19 + 16] = v;
+        dst[(t >> 3) * 19 + 17] = v >> 8;
+        dst[(t >> 3) * 19 + 18] = v >> 16;
+      }
+      return;
+    case 20:
+      v64 = static_cast<uint64_t>(shuffle_xor(v, 1)) << 20 | v;
+      if (t < count && !(t & MASK2T)) {
+        dst[(t >> 1) * 5 + 0] = v64;
+        dst[(t >> 1) * 5 + 1] = v64 >> 8;
+        dst[(t >> 1) * 5 + 2] = v64 >> 16;
+        dst[(t >> 1) * 5 + 3] = v64 >> 24;
+        dst[(t >> 1) * 5 + 4] = v64 >> 32;
+      }
+      return;
+    case 22:
+      v64  = static_cast<uint64_t>(shuffle_xor(v, 1)) << 22 | v;
+      v128 = static_cast<__uint128_t>(shuffle_xor(v64, 2)) << 44 | v64;
+      if (t < count && !(t & MASK4T)) {
+        dst[(t >> 2) * 11 + 0]  = v128;
+        dst[(t >> 2) * 11 + 1]  = v128 >> 8;
+        dst[(t >> 2) * 11 + 2]  = v128 >> 16;
+        dst[(t >> 2) * 11 + 3]  = v128 >> 24;
+        dst[(t >> 2) * 11 + 4]  = v128 >> 32;
+        dst[(t >> 2) * 11 + 5]  = v128 >> 40;
+        dst[(t >> 2) * 11 + 6]  = v128 >> 48;
+        dst[(t >> 2) * 11 + 7]  = v128 >> 56;
+        dst[(t >> 2) * 11 + 8]  = v128 >> 64;
+        dst[(t >> 2) * 11 + 9]  = v128 >> 72;
+        dst[(t >> 2) * 11 + 10] = v128 >> 80;
+      }
+      return;
+#endif
+    case 24:
+      if (t < count) {
+        dst[t * 3 + 0] = v;
+        dst[t * 3 + 1] = v >> 8;
+        dst[t * 3 + 2] = v >> 16;
+      }
+      return;
+    default: CUDF_UNREACHABLE("Unsupported bit width");
+  }
 }
 
 /**
