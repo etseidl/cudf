@@ -4395,7 +4395,7 @@ TEST_P(ParquetSizedTest, DictionaryTest)
   // set row group size so that there will be only one row group
   // no compression so we can easily read page data
   cudf::io::parquet_writer_options out_opts =
-    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected)
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, expected)
       .compression(cudf::io::compression_type::NONE)
       .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
       .row_group_size_rows(nrows)
@@ -4403,8 +4403,8 @@ TEST_P(ParquetSizedTest, DictionaryTest)
   cudf::io::write_parquet(out_opts);
 
   cudf::io::parquet_reader_options default_in_opts =
-    cudf::io::parquet_reader_options::builder(cudf_io::source_info{filepath});
-  auto const result = cudf_io::read_parquet(default_in_opts);
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
+  auto const result = cudf::io::read_parquet(default_in_opts);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
 
@@ -4437,6 +4437,55 @@ TEST_P(ParquetSizedTest, DictionaryTest)
     *std::lower_bound(allowed_bitsizes.begin(), allowed_bitsizes.end(), expected_bits);
 
   EXPECT_EQ(nbits, rle_bits);
+}
+
+TEST_F(ParquetReaderTest, RangeReaderTest)
+{
+  constexpr auto num_rows = 100000;
+
+  // fixed length strings
+  auto str1_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
+    char buf[30];
+    snprintf(buf, sizeof(buf), "%012d", i);
+    return std::string(buf);
+  });
+  auto col0          = cudf::test::strings_column_wrapper(str1_elements, str1_elements + num_rows);
+
+  auto col1_data = random_values<int8_t>(num_rows);
+  auto col2_data = random_values<int16_t>(num_rows);
+  auto col3_data = random_values<int32_t>(num_rows);
+  auto col4_data = random_values<uint64_t>(num_rows);
+  auto col5_data = random_values<float>(num_rows);
+  auto col6_data = random_values<double>(num_rows);
+
+  auto col1 = cudf::test::fixed_width_column_wrapper<int8_t>(col1_data.begin(), col1_data.end());
+  auto col2 = cudf::test::fixed_width_column_wrapper<int16_t>(col2_data.begin(), col2_data.end());
+  auto col3 = cudf::test::fixed_width_column_wrapper<int32_t>(col3_data.begin(), col3_data.end());
+  auto col4 = cudf::test::fixed_width_column_wrapper<uint64_t>(col4_data.begin(), col4_data.end());
+  auto col5 = cudf::test::fixed_width_column_wrapper<float>(col5_data.begin(), col5_data.end());
+  auto col6 = cudf::test::fixed_width_column_wrapper<double>(col6_data.begin(), col6_data.end());
+
+  // mixed length strings
+  auto str2_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
+    return std::to_string(i);
+  });
+  auto col7          = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
+
+  auto const expected = table_view{{col0, col1, col2, col3, col4, col5, col6, col7}};
+
+  auto const filepath = temp_env->get_temp_filepath("CheckColumnOffsetIndex.parquet");
+  const cudf::io::parquet_writer_options out_opts =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, expected)
+      .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+      .max_page_size_rows(20000);
+  cudf::io::write_parquet(out_opts);
+
+  cudf::io::parquet_reader_options default_in_opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
+
+  constexpr cudf::size_type key_col = 0;
+  cudf::io::parquet_range range(key_col, std::string{"000000000"}, std::string{"000001000"});
+  auto const result = cudf::io::read_parquet(default_in_opts, range);
 }
 
 CUDF_TEST_PROGRAM_MAIN()

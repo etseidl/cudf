@@ -60,19 +60,28 @@ class parquet_range {
  public:
   parquet_range() = default;
   parquet_range(size_type key_col) : _key_column(key_col) {}
+  parquet_range(size_type key_col, std::string const& start, std::string const& end) : _key_column(key_col) {
+    set_range(start, end);
+  }
+
+  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
+  parquet_range(size_type key_col, T start, T end) : _key_column(key_col) {
+    set_range(start, end);
+  }
 
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   void set_range(T start, T end) {
     auto const start_ptr = reinterpret_cast<std::byte const*>(&start);
     _begin.assign(start_ptr, start_ptr + sizeof(start));
     auto const end_ptr = reinterpret_cast<std::byte const*>(&end);
-    _begin.assign(end_ptr, end_ptr + sizeof(end));
+    _end.assign(end_ptr, end_ptr + sizeof(end));
   }
 
-  template <typename T, CUDF_ENABLE_IF(std::is_same_v<T, std::string>)>
   void set_range(std::string const& start, std::string const& end) {
-    _begin.assign(start.begin(), start.end());
-    _end.assign(end.begin(), end.end());
+    auto const start_ptr = reinterpret_cast<std::byte const*>(start.c_str());
+    _begin.assign(start_ptr, start_ptr + start.size());
+    auto const end_ptr = reinterpret_cast<std::byte const*>(end.c_str());
+    _end.assign(end_ptr, end_ptr + end.size());
   }
 };
 
