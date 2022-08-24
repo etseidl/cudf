@@ -47,22 +47,32 @@ constexpr size_type default_column_index_truncate_length = 64;  ///< truncate to
 class parquet_reader_options_builder;
 
 /**
- * @brief Describes a range to read from a parquet file.  Takes the form of a column
- * and start/end keys.
+ * @brief Describes a range to read from a parquet file. 
+ * 
+ * Takes the form of a column and start/end keys. start is inclusive, end is exclusive, i.e. [start,end).
  */
 class parquet_range {
   size_type _key_column{-1};
-  std::vector<uint8_t> _begin{}; // parquet stats are binary, so store as binary here. will translate
-  std::vector<uint8_t> _end{};   // in the reader once the schema is known.
+  std::vector<std::byte> _begin{}; // parquet stats are binary, so store as binary here. will translate
+  std::vector<std::byte> _end{};   // in the reader once the schema is known.
 
  public:
   parquet_range() = default;
   parquet_range(size_type key_col) : _key_column(key_col) {}
 
-  void set_range(int64_t start, int64_t end);
-  void set_range(uint64_t start, uint64_t end);
-  void set_range(std::string const& start, std::string const& end);
-  // TODO more types
+  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>()>
+  void set_range(T start, T end) {
+    auto const start_ptr = reinterpret_cast<std::byte const*>(&start);
+    _begin.assign(start_ptr, start_ptr + sizeof(start));
+    auto const end_ptr = reinterpret_cast<std::byte const*>(&end);
+    _begin.assign(end_ptr, end_ptr + sizeof(end));
+  }
+
+  template <typename T, CUDF_ENABLE_IF(std::is_same<T, std::string>)>
+  void set_range(std::string const& start, std::string const& end) {
+    _begin.assign(start.begin(), start.end());
+    _end.assign(end.begin(), end.end());
+  }
 };
 
 /**
