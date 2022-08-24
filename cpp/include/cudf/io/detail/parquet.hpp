@@ -37,6 +37,7 @@ namespace io {
 class parquet_reader_options;
 class parquet_writer_options;
 class chunked_parquet_writer_options;
+class parquet_range;
 
 namespace detail {
 namespace parquet {
@@ -67,6 +68,41 @@ class reader {
    * @brief Destructor explicitly-declared to avoid inlined in header
    */
   ~reader();
+
+  /**
+   * @brief Reads the dataset as per given options.
+   *
+   * @param options Settings for controlling reading behavior
+   *
+   * @return The set of columns along with table metadata
+   */
+  table_with_metadata read(parquet_reader_options const& options);
+};
+
+class range_reader {
+ private:
+  class impl;
+  std::unique_ptr<impl> _impl;
+
+ public:
+  /**
+   * @brief Constructor from an array of datasources
+   *
+   * @param sources Input `datasource` objects to read the dataset from
+   * @param options Settings for controlling reading behavior
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param mr Device memory resource to use for device memory allocation
+   */
+  explicit range_reader(std::vector<std::unique_ptr<cudf::io::datasource>>&& sources,
+                        parquet_reader_options const& options,
+                        parquet_range const& range,
+                        rmm::cuda_stream_view stream,
+                        rmm::mr::device_memory_resource* mr);
+
+  /**
+   * @brief Destructor explicitly-declared to avoid inlined in header
+   */
+  ~range_reader();
 
   /**
    * @brief Reads the dataset as per given options.

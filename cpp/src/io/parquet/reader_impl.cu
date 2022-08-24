@@ -1796,6 +1796,97 @@ table_with_metadata reader::read(parquet_reader_options const& options)
   return _impl->read(options.get_row_groups());
 }
 
+////////////////////////////////////////////////////////////////////////////
+// range reader
+
+table_with_metadata range_reader::impl::read(std::vector<std::vector<size_type>> const& row_group_list)
+{
+  // Select only row groups required
+  const auto [selected_row_groups, num_rows] = _metadata->select_row_groups(row_group_list);
+
+  table_metadata out_metadata;
+
+  // output cudf columns as determined by the top level schema
+  std::vector<std::unique_ptr<column>> out_columns;
+  out_columns.reserve(_output_columns.size());
+
+  // stuff
+  // 1) read footer and column index info for selected columns, including key column from range
+  // 2) figure out row groups/pages needed for key column based on range
+  // 3) calculate row numbers from 2)
+  // 4) use column index to figure out pages needed for other columns
+  // 5) read/decompress needed pages, create output columns
+  // 6) profit!
+
+  // Create empty columns as needed (this can happen if we've ended up with no actual data to read)
+  for (size_t i = out_columns.size(); i < _output_columns.size(); ++i) {
+    column_name_info& col_name = out_metadata.schema_info.emplace_back("");
+    out_columns.emplace_back(io::detail::empty_like(_output_columns[i], &col_name, _stream, _mr));
+  }
+
+  // Return column names (must match order of returned columns)
+  out_metadata.column_names.resize(_output_columns.size());
+  for (size_t i = 0; i < _output_column_schemas.size(); i++) {
+    auto const& schema           = _metadata->get_schema(_output_column_schemas[i]);
+    out_metadata.column_names[i] = schema.name;
+  }
+
+  // Return user metadata
+  out_metadata.per_file_user_data = _metadata->get_key_value_metadata();
+  out_metadata.user_data          = {out_metadata.per_file_user_data[0].begin(),
+                            out_metadata.per_file_user_data[0].end()};
+
+  return {std::make_unique<table>(std::move(out_columns)), std::move(out_metadata)};
+}
+
+range_reader::impl::impl(std::vector<std::unique_ptr<datasource>>&& sources,
+                         parquet_reader_options const& options,
+                         parquet_range const& range,
+                         rmm::cuda_stream_view stream,
+                         rmm::mr::device_memory_resource* mr)
+  : _stream(stream), _mr(mr), _sources(std::move(sources)), _range(range)
+{
+  // Open and parse the source dataset metadata
+  _metadata = std::make_unique<aggregate_reader_metadata>(_sources);
+
+  // Override output timestamp resolution if requested
+  if (options.get_timestamp_type().id() != type_id::EMPTY) {
+    _timestamp_type = options.get_timestamp_type();
+  }
+
+  // Strings may be returned as either string or categorical columns
+  _strings_to_categorical = options.is_enabled_convert_strings_to_categories();
+
+  // Binary columns can be read as binary or strings
+  _reader_column_schema = options.get_column_schema();
+
+  // Select only columns required by the options
+  std::tie(_input_columns, _output_columns, _output_column_schemas) =
+    _metadata->select_columns(options.get_columns(),
+                              options.is_enabled_use_pandas_metadata(),
+                              _strings_to_categorical,
+                              _timestamp_type.id());
+}
+
+// Forward to implementation
+range_reader::range_reader(std::vector<std::unique_ptr<cudf::io::datasource>>&& sources,
+                           parquet_reader_options const& options,
+                           parquet_range const& range,
+                           rmm::cuda_stream_view stream,
+                           rmm::mr::device_memory_resource* mr)
+  : _impl(std::make_unique<impl>(std::move(sources), options, range, stream, mr))
+{
+}
+
+// Destructor within this translation unit
+range_reader::~range_reader() = default;
+
+// Forward to implementation
+table_with_metadata range_reader::read(parquet_reader_options const& options)
+{
+  return _impl->read(options.get_row_groups());
+}
+
 }  // namespace parquet
 }  // namespace detail
 }  // namespace io

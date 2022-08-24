@@ -21,6 +21,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/mr/device/per_device_resource.hpp>
 
@@ -60,7 +61,7 @@ class parquet_range {
   parquet_range() = default;
   parquet_range(size_type key_col) : _key_column(key_col) {}
 
-  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>()>
+  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   void set_range(T start, T end) {
     auto const start_ptr = reinterpret_cast<std::byte const*>(&start);
     _begin.assign(start_ptr, start_ptr + sizeof(start));
@@ -68,7 +69,7 @@ class parquet_range {
     _begin.assign(end_ptr, end_ptr + sizeof(end));
   }
 
-  template <typename T, CUDF_ENABLE_IF(std::is_same<T, std::string>)>
+  template <typename T, CUDF_ENABLE_IF(std::is_same_v<T, std::string>)>
   void set_range(std::string const& start, std::string const& end) {
     _begin.assign(start.begin(), start.end());
     _end.assign(end.begin(), end.end());
@@ -353,6 +354,10 @@ class parquet_reader_options_builder {
  */
 table_with_metadata read_parquet(
   parquet_reader_options const& options,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+
+table_with_metadata read_parquet(
+  parquet_reader_options const& options, parquet_range const& range,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
 
 /** @} */  // end of group

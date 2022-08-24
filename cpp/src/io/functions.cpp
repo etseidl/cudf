@@ -421,6 +421,19 @@ table_with_metadata read_parquet(parquet_reader_options const& options,
   return reader->read(options);
 }
 
+table_with_metadata read_parquet(parquet_reader_options const& options,
+                                 parquet_range const& range,
+                                 rmm::mr::device_memory_resource* mr)
+{
+  CUDF_FUNC_RANGE();
+
+  auto datasources = make_datasources(options.get_source());
+  auto reader      = std::make_unique<detail_parquet::range_reader>(
+    std::move(datasources), options, range, cudf::default_stream_value, mr);
+
+  return reader->read(options);
+}
+
 /**
  * @copydoc cudf::io::merge_row_group_metadata
  */
