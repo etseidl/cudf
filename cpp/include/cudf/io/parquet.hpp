@@ -54,8 +54,12 @@ class parquet_reader_options_builder;
  */
 class parquet_range {
   size_type _key_column{-1};
-  std::vector<std::byte> _begin{}; // parquet stats are binary, so store as binary here. will translate
-  std::vector<std::byte> _end{};   // in the reader once the schema is known.
+  std::vector<uint8_t> _start{}; // parquet stats are binary, so store as binary here. will translate
+  std::vector<uint8_t> _end{};   // in the reader once the schema is known.
+
+  void print_vector(std::vector<uint8_t> const& vec) const {
+    for (auto c : vec) { printf("%c", (char)c); }
+  }
 
  public:
   parquet_range() = default;
@@ -69,19 +73,33 @@ class parquet_range {
     set_range(start, end);
   }
 
+  void print() const {
+    printf("range [");
+    print_vector(_start);
+    printf(", ");
+    print_vector(_end);
+    printf(")\n");
+  }
+
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   void set_range(T start, T end) {
-    auto const start_ptr = reinterpret_cast<std::byte const*>(&start);
-    _begin.assign(start_ptr, start_ptr + sizeof(start));
-    auto const end_ptr = reinterpret_cast<std::byte const*>(&end);
+    auto const start_ptr = reinterpret_cast<uint8_t const*>(&start);
+    _start.assign(start_ptr, start_ptr + sizeof(start));
+    auto const end_ptr = reinterpret_cast<uint8_t const*>(&end);
     _end.assign(end_ptr, end_ptr + sizeof(end));
   }
 
   void set_range(std::string const& start, std::string const& end) {
-    auto const start_ptr = reinterpret_cast<std::byte const*>(start.c_str());
-    _begin.assign(start_ptr, start_ptr + start.size());
-    auto const end_ptr = reinterpret_cast<std::byte const*>(end.c_str());
+    auto const start_ptr = reinterpret_cast<uint8_t const*>(start.c_str());
+    _start.assign(start_ptr, start_ptr + start.size());
+    auto const end_ptr = reinterpret_cast<uint8_t const*>(end.c_str());
     _end.assign(end_ptr, end_ptr + end.size());
+  }
+
+  size_type key_column() const { return _key_column; }
+
+  bool range_matches(std::vector<uint8_t> const& start, std::vector<uint8_t> const& end) const {
+    return _start <= end and _end > start;
   }
 };
 
