@@ -216,7 +216,7 @@ class range_reader::impl {
    *
    * @return The set of columns along with metadata
    */
-  table_with_metadata read(std::vector<std::vector<size_type>> const& row_group_indices);
+  table_with_metadata read();
 
  private:
   /**

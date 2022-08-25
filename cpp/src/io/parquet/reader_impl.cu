@@ -299,7 +299,7 @@ std::string name_from_path(const std::vector<std::string>& path_in_schema)
  * @brief Class for parsing dataset metadata
  */
 struct metadata : public FileMetaData {
-  explicit metadata(datasource* source)
+  explicit metadata(datasource* source, bool read_colidx = false)
   {
     constexpr auto header_len = sizeof(file_header_s);
     constexpr auto ender_len  = sizeof(file_ender_s);
@@ -319,7 +319,32 @@ struct metadata : public FileMetaData {
     CompactProtocolReader cp(buffer->data(), ender->footer_len);
     CUDF_EXPECTS(cp.read(this), "Cannot parse metadata");
     CUDF_EXPECTS(cp.InitSchema(this), "Cannot initialize schema");
+
+    // TODO(ets): terminate early if no index info.  check bounds on row_groups and columns.
+    if (read_colidx) {
+      for (auto const& rg : row_groups) {
+        for (auto const& col : rg.columns) {
+          if (col.offset_index_offset > 0) {
+            const auto buf = source->host_read(col.offset_index_offset, col.offset_index_length);
+            cp.init(buf->data(), buf->size());
+            OffsetIndex oi;
+            CUDF_EXPECTS(cp.read(&oi), "Cannot parse offset index");
+            offset_indexes.push_back(std::move(oi));
+          }
+          if (col.column_index_offset > 0) {
+            const auto buf = source->host_read(col.column_index_offset, col.column_index_length);
+            cp.init(buf->data(), buf->size());
+            ColumnIndex ci;
+            CUDF_EXPECTS(cp.read(&ci), "Cannot parse offset index");
+            column_indexes.push_back(std::move(ci));
+          }
+        }
+      }
+    }
   }
+
+  std::vector<OffsetIndex> offset_indexes;
+  std::vector<ColumnIndex> column_indexes;
 };
 
 class aggregate_reader_metadata {
@@ -330,12 +355,12 @@ class aggregate_reader_metadata {
   /**
    * @brief Create a metadata object from each element in the source vector
    */
-  auto metadatas_from_sources(std::vector<std::unique_ptr<datasource>> const& sources)
+  auto metadatas_from_sources(std::vector<std::unique_ptr<datasource>> const& sources, bool read_colidx)
   {
     std::vector<metadata> metadatas;
     std::transform(
-      sources.cbegin(), sources.cend(), std::back_inserter(metadatas), [](auto const& source) {
-        return metadata(source.get());
+      sources.cbegin(), sources.cend(), std::back_inserter(metadatas), [read_colidx](auto const& source) {
+        return metadata(source.get(), read_colidx);
       });
     return metadatas;
   }
@@ -386,8 +411,8 @@ class aggregate_reader_metadata {
   }
 
  public:
-  aggregate_reader_metadata(std::vector<std::unique_ptr<datasource>> const& sources)
-    : per_file_metadata(metadatas_from_sources(sources)),
+  aggregate_reader_metadata(std::vector<std::unique_ptr<datasource>> const& sources, bool read_colidx = false)
+    : per_file_metadata(metadatas_from_sources(sources, read_colidx)),
       keyval_maps(collect_keyval_metadata()),
       num_rows(calc_num_rows()),
       num_row_groups(calc_num_row_groups())
@@ -530,6 +555,7 @@ class aggregate_reader_metadata {
     size_type const index;
     size_t const start_row;  // TODO source index
     size_type const source_index;
+    std::vector<size_type> pages;  // pages within row group to scan
     row_group_info(size_type index, size_t start_row, size_type source_index)
       : index(index), start_row(start_row), source_index(source_index)
     {
@@ -583,6 +609,75 @@ class aggregate_reader_metadata {
     }
 
     return {selection, row_count};
+  }
+
+  void print_vector(std::vector<uint8_t> const& vec) const {
+    for (auto c : vec) { printf("%c", (char)c); }
+  }
+
+  [[nodiscard]] std::pair<std::vector<row_group_info>, size_type> select_row_groups(parquet_range const& range) const {
+    size_type row_count = 0;
+
+    row_count = static_cast<size_type>(
+      std::min<int64_t>(get_num_rows(), std::numeric_limits<size_type>::max()));
+    CUDF_EXPECTS(row_count >= 0, "Invalid row count");
+
+    std::vector<row_group_info> selection;
+    size_type count = 0;
+    size_type total_rows = 0;
+    for (size_t src_idx = 0; src_idx < per_file_metadata.size(); ++src_idx) {
+      for (size_t rg_idx = 0; rg_idx < per_file_metadata[src_idx].row_groups.size(); ++rg_idx) {
+        auto const& rg = get_row_group(rg_idx, src_idx);
+        auto const& key_chunk = rg.columns[range.key_column()];
+        auto const& stats_blob = key_chunk.meta_data.statistics_blob;
+
+        CompactProtocolReader rdr(stats_blob.data(), stats_blob.size());
+        Statistics stats;
+        bool res = rdr.read(&stats);
+        CUDF_EXPECTS(res, "Cannot parse statistics.");
+
+        range.print();
+
+        printf("test rg %ld (", rg_idx);
+        print_vector(stats.min_value);
+        printf(", ");
+        print_vector(stats.max_value);
+        printf(")\n");
+        if (range.range_matches(stats.min_value, stats.max_value)) {
+          // still want start of chunk so we can find dictionary page if needed
+          auto const chunk_start_row = count;
+          count += rg.num_rows;
+          row_group_info rgi(rg_idx, chunk_start_row, src_idx);
+
+          auto const& colidx =
+            per_file_metadata[src_idx].column_indexes[rg_idx * rg.columns.size() + range.key_column()];
+          auto const& offidx =
+            per_file_metadata[src_idx].offset_indexes[rg_idx * rg.columns.size() + range.key_column()];
+          auto num_pages = colidx.null_pages.size();
+          for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
+            // don't bother if all null
+            if (colidx.null_pages[pg_idx]) continue;
+
+            if (range.range_matches(colidx.min_values[pg_idx], colidx.max_values[pg_idx])) {
+              printf("adding [");
+              print_vector(colidx.min_values[pg_idx]);
+              printf(",  ");
+              print_vector(colidx.max_values[pg_idx]);
+              printf(")\n");
+              rgi.pages.emplace_back(pg_idx);
+              total_rows += pg_idx == (num_pages - 1) ? rg.num_rows - offidx.page_locations[pg_idx].first_row_index
+                : offidx.page_locations[pg_idx + 1].first_row_index - offidx.page_locations[pg_idx].first_row_index;
+            }
+          }
+
+          selection.emplace_back(rgi);
+          printf("count %d row_count %d\n", count, row_count);
+          if (count >= row_count) { break; }
+        }
+      }
+    }
+
+    return {selection, total_rows};
   }
 
   /**
@@ -1799,17 +1894,8 @@ table_with_metadata reader::read(parquet_reader_options const& options)
 ////////////////////////////////////////////////////////////////////////////
 // range reader
 
-table_with_metadata range_reader::impl::read(std::vector<std::vector<size_type>> const& row_group_list)
+table_with_metadata range_reader::impl::read()
 {
-  // Select only row groups required
-  const auto [selected_row_groups, num_rows] = _metadata->select_row_groups(row_group_list);
-
-  table_metadata out_metadata;
-
-  // output cudf columns as determined by the top level schema
-  std::vector<std::unique_ptr<column>> out_columns;
-  out_columns.reserve(_output_columns.size());
-
   // stuff
   // 1) read footer and column index info for selected columns, including key column from range
   // 2) figure out row groups/pages needed for key column based on range
@@ -1817,6 +1903,20 @@ table_with_metadata range_reader::impl::read(std::vector<std::vector<size_type>>
   // 4) use column index to figure out pages needed for other columns
   // 5) read/decompress needed pages, create output columns
   // 6) profit!
+
+  // Select only row groups required
+  const auto [selected_row_groups, num_rows] = _metadata->select_row_groups(_range);
+  printf("selected %ld row groups and %d rows\n", selected_row_groups.size(), num_rows);
+  for (auto const& rgi : selected_row_groups) {
+    printf("  npages %ld\n", rgi.pages.size());
+    for (auto const pg : rgi.pages) printf("    %d\n", pg);
+  }
+
+  table_metadata out_metadata;
+
+  // output cudf columns as determined by the top level schema
+  std::vector<std::unique_ptr<column>> out_columns;
+  out_columns.reserve(_output_columns.size());
 
   // Create empty columns as needed (this can happen if we've ended up with no actual data to read)
   for (size_t i = out_columns.size(); i < _output_columns.size(); ++i) {
@@ -1847,7 +1947,7 @@ range_reader::impl::impl(std::vector<std::unique_ptr<datasource>>&& sources,
   : _stream(stream), _mr(mr), _sources(std::move(sources)), _range(range)
 {
   // Open and parse the source dataset metadata
-  _metadata = std::make_unique<aggregate_reader_metadata>(_sources);
+  _metadata = std::make_unique<aggregate_reader_metadata>(_sources, true);
 
   // Override output timestamp resolution if requested
   if (options.get_timestamp_type().id() != type_id::EMPTY) {
@@ -1884,7 +1984,7 @@ range_reader::~range_reader() = default;
 // Forward to implementation
 table_with_metadata range_reader::read(parquet_reader_options const& options)
 {
-  return _impl->read(options.get_row_groups());
+  return _impl->read();
 }
 
 }  // namespace parquet
