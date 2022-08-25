@@ -4441,7 +4441,7 @@ TEST_P(ParquetSizedTest, DictionaryTest)
 
 TEST_F(ParquetReaderTest, RangeReaderTest)
 {
-  constexpr auto num_rows = 100000;
+  constexpr auto num_rows = 10'000'000;
 
   // fixed length strings
   auto str1_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
@@ -4473,18 +4473,20 @@ TEST_F(ParquetReaderTest, RangeReaderTest)
 
   auto const expected = table_view{{col0, col1, col2, col3, col4, col5, col6, col7}};
 
-  auto const filepath = temp_env->get_temp_filepath("CheckColumnOffsetIndex.parquet");
+  auto const filepath = temp_env->get_temp_filepath("RangeReader.parquet");
   const cudf::io::parquet_writer_options out_opts =
     cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, expected)
       .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
-      .max_page_size_rows(20000);
+      .row_group_size_bytes(64 * 1024 * 1024)
+      .row_group_size_rows(1'000'000)
+      .max_page_size_rows(20'000);
   cudf::io::write_parquet(out_opts);
 
   cudf::io::parquet_reader_options default_in_opts =
     cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
 
   constexpr cudf::size_type key_col = 0;
-  cudf::io::parquet_range range(key_col, std::string{"000000000"}, std::string{"000001000"});
+  cudf::io::parquet_range range(key_col, std::string{"000000030000"}, std::string{"000000070000"});
   auto const result = cudf::io::read_parquet(default_in_opts, range);
 }
 
