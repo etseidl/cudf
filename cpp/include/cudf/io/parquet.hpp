@@ -112,7 +112,7 @@ class parquet_range {
 
   bool range_matches(std::vector<uint8_t> const& start, std::vector<uint8_t> const& end) const
   {
-    return _start <= end and _end > start;
+    return _start < end and _end > start;
   }
 };
 
