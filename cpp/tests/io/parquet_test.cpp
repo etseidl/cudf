@@ -3672,10 +3672,9 @@ TEST_F(ParquetWriterTest, CheckColumnOffsetIndex)
   auto col6 = cudf::test::fixed_width_column_wrapper<double>(col6_data.begin(), col6_data.end());
 
   // mixed length strings
-  auto str2_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
-    return std::to_string(i);
-  });
-  auto col7          = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
+  auto str2_elements =
+    cudf::detail::make_counting_transform_iterator(0, [](auto i) { return std::to_string(i); });
+  auto col7 = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
 
   auto const expected = table_view{{col0, col1, col2, col3, col4, col5, col6, col7}};
 
@@ -3767,9 +3766,8 @@ TEST_F(ParquetWriterTest, CheckColumnOffsetIndexNulls)
     cudf::test::fixed_width_column_wrapper<double>(col6_data.begin(), col6_data.end(), valids);
 
   // mixed length strings
-  auto str2_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
-    return std::to_string(i);
-  });
+  auto str2_elements =
+    cudf::detail::make_counting_transform_iterator(0, [](auto i) { return std::to_string(i); });
   auto col7 = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows, valids);
 
   auto expected = table_view{{col0, col1, col2, col3, col4, col5, col6, col7}};
@@ -3850,10 +3848,9 @@ TEST_F(ParquetWriterTest, CheckColumnOffsetIndexNullColumn)
   auto col2 = cudf::test::fixed_width_column_wrapper<int32_t>(col2_data.begin(), col2_data.end());
 
   // mixed length strings
-  auto str2_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
-    return std::to_string(i);
-  });
-  auto col3          = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
+  auto str2_elements =
+    cudf::detail::make_counting_transform_iterator(0, [](auto i) { return std::to_string(i); });
+  auto col3 = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
 
   auto expected = table_view{{col0, col1, col2, col3}};
 
@@ -4466,10 +4463,9 @@ TEST_F(ParquetReaderTest, RangeReaderTest)
   auto col6 = cudf::test::fixed_width_column_wrapper<double>(col6_data.begin(), col6_data.end());
 
   // mixed length strings
-  auto str2_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
-    return std::to_string(i);
-  });
-  auto col7          = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
+  auto str2_elements =
+    cudf::detail::make_counting_transform_iterator(0, [](auto i) { return std::to_string(i); });
+  auto col7 = cudf::test::strings_column_wrapper(str2_elements, str2_elements + num_rows);
 
   auto const expected = table_view{{col0, col1, col2, col3, col4, col5, col6, col7}};
 

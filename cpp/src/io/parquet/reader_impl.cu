@@ -355,13 +355,15 @@ class aggregate_reader_metadata {
   /**
    * @brief Create a metadata object from each element in the source vector
    */
-  auto metadatas_from_sources(std::vector<std::unique_ptr<datasource>> const& sources, bool read_colidx)
+  auto metadatas_from_sources(std::vector<std::unique_ptr<datasource>> const& sources,
+                              bool read_colidx)
   {
     std::vector<metadata> metadatas;
     std::transform(
-      sources.cbegin(), sources.cend(), std::back_inserter(metadatas), [read_colidx](auto const& source) {
-        return metadata(source.get(), read_colidx);
-      });
+      sources.cbegin(),
+      sources.cend(),
+      std::back_inserter(metadatas),
+      [read_colidx](auto const& source) { return metadata(source.get(), read_colidx); });
     return metadatas;
   }
 
@@ -411,7 +413,8 @@ class aggregate_reader_metadata {
   }
 
  public:
-  aggregate_reader_metadata(std::vector<std::unique_ptr<datasource>> const& sources, bool read_colidx = false)
+  aggregate_reader_metadata(std::vector<std::unique_ptr<datasource>> const& sources,
+                            bool read_colidx = false)
     : per_file_metadata(metadatas_from_sources(sources, read_colidx)),
       keyval_maps(collect_keyval_metadata()),
       num_rows(calc_num_rows()),
@@ -555,7 +558,6 @@ class aggregate_reader_metadata {
     size_type const index;
     size_t const start_row;  // TODO source index
     size_type const source_index;
-    std::vector<size_type> pages;  // pages within row group to scan
     row_group_info(size_type index, size_t start_row, size_type source_index)
       : index(index), start_row(start_row), source_index(source_index)
     {
@@ -611,26 +613,69 @@ class aggregate_reader_metadata {
     return {selection, row_count};
   }
 
-  void print_vector(std::vector<uint8_t> const& vec) const {
-    for (auto c : vec) { printf("%c", (char)c); }
+  // FIXME(ets): just for debugging.  remove when done.
+  void print_vector(std::vector<uint8_t> const& vec) const
+  {
+    for (auto c : vec) {
+      printf("%c", (char)c);
+    }
   }
 
-  [[nodiscard]] std::pair<std::vector<row_group_info>, size_type> select_row_groups(parquet_range const& range) const {
+  // wants:
+  //   need for each source file:
+  //     needed row groups
+  //       src_file_index
+  //       start_row
+  //       column_info for each column requested
+  //         dict_offset
+  //         num_data_pages
+  //         for each data page
+  //           page_location (offset, start_idx (rel to row group), compressed_size)
+  //           num_values (from page header, deferred: do future stuff to read pages then get this
+  //           info)
+  //
+  //
+  struct column_info {
+    uint64_t dictionary_offset;
+    std::vector<PageLocation> pages;
+  };
+
+  struct row_group_page_info {
+    size_type const index;
+    size_t const start_row;
+    size_type const source_index;
+    std::vector<column_info> chunks;
+
+    row_group_page_info(size_type index, size_t start_row, size_type source_index)
+      : index(index), start_row(start_row), source_index(source_index)
+    {
+    }
+  };
+
+  /**
+   * @brief return list of row groups and pages for the keying column that match the given range.
+   */
+  [[nodiscard]] std::pair<std::vector<row_group_page_info>, size_type> select_row_groups_for_key(
+    parquet_range const& range) const
+  {
     size_type row_count = 0;
 
     row_count = static_cast<size_type>(
       std::min<int64_t>(get_num_rows(), std::numeric_limits<size_type>::max()));
     CUDF_EXPECTS(row_count >= 0, "Invalid row count");
 
-    std::vector<row_group_info> selection;
-    size_type count = 0;
+    std::vector<row_group_page_info> selection;
+    size_type count      = 0;
     size_type total_rows = 0;
     for (size_t src_idx = 0; src_idx < per_file_metadata.size(); ++src_idx) {
-      for (size_t rg_idx = 0; rg_idx < per_file_metadata[src_idx].row_groups.size(); ++rg_idx) {
-        auto const& rg = get_row_group(rg_idx, src_idx);
-        auto const& key_chunk = rg.columns[range.key_column()];
+      auto const& fmd = per_file_metadata[src_idx];
+
+      for (size_t rg_idx = 0; rg_idx < fmd.row_groups.size(); ++rg_idx) {
+        auto const& rg         = fmd.row_groups[rg_idx];
+        auto const& key_chunk  = rg.columns[range.key_column()];
         auto const& stats_blob = key_chunk.meta_data.statistics_blob;
 
+        // parse statistics blob and use stats to see what row groups we need
         CompactProtocolReader rdr(stats_blob.data(), stats_blob.size());
         Statistics stats;
         bool res = rdr.read(&stats);
@@ -647,12 +692,16 @@ class aggregate_reader_metadata {
           // still want start of chunk so we can find dictionary page if needed
           auto const chunk_start_row = count;
           count += rg.num_rows;
-          row_group_info rgi(rg_idx, chunk_start_row, src_idx);
+          row_group_page_info rgi(rg_idx, chunk_start_row, src_idx);
 
-          auto const& colidx =
-            per_file_metadata[src_idx].column_indexes[rg_idx * rg.columns.size() + range.key_column()];
-          auto const& offidx =
-            per_file_metadata[src_idx].offset_indexes[rg_idx * rg.columns.size() + range.key_column()];
+          int64_t low_row_idx  = INT64_MAX;
+          int64_t high_row_idx = -1;
+
+          auto const& colidx = per_file_metadata[src_idx]
+                                 .column_indexes[rg_idx * rg.columns.size() + range.key_column()];
+          auto const& offidx = per_file_metadata[src_idx]
+                                 .offset_indexes[rg_idx * rg.columns.size() + range.key_column()];
+
           auto num_pages = colidx.null_pages.size();
           for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
             // don't bother if all null
@@ -665,8 +714,10 @@ class aggregate_reader_metadata {
               print_vector(colidx.max_values[pg_idx]);
               printf(")\n");
               rgi.pages.emplace_back(pg_idx);
-              total_rows += pg_idx == (num_pages - 1) ? rg.num_rows - offidx.page_locations[pg_idx].first_row_index
-                : offidx.page_locations[pg_idx + 1].first_row_index - offidx.page_locations[pg_idx].first_row_index;
+              total_rows += pg_idx == (num_pages - 1)
+                              ? rg.num_rows - offidx.page_locations[pg_idx].first_row_index
+                              : offidx.page_locations[pg_idx + 1].first_row_index -
+                                  offidx.page_locations[pg_idx].first_row_index;
             }
           }
 
@@ -1904,12 +1955,19 @@ table_with_metadata range_reader::impl::read()
   // 5) read/decompress needed pages, create output columns
   // 6) profit!
 
-  // Select only row groups required
-  const auto [selected_row_groups, num_rows] = _metadata->select_row_groups(_range);
+  // 1) read footer and column index info for selected columns, including key column from range
+  // 2) figure out row groups/pages needed for key column based on range
+  // 3) calculate row numbers from 2)
+  // 3a) fetch needed pages, decompress, and then read to get exact row numbers
+  // actually, for now let's just use row nums from the page list, to guess pages
+  // for the other columns.  will probably end up reading some pages we don't need
+  // so can get more restricted set after we figure out how to read partial row chunks.
+  const auto [selected_row_groups, num_rows] = _metadata->select_row_groups_for_key(_range);
   printf("selected %ld row groups and %d rows\n", selected_row_groups.size(), num_rows);
   for (auto const& rgi : selected_row_groups) {
     printf("  npages %ld\n", rgi.pages.size());
-    for (auto const pg : rgi.pages) printf("    %d\n", pg);
+    for (auto const pg : rgi.pages)
+      printf("    %d\n", pg);
   }
 
   table_metadata out_metadata;
