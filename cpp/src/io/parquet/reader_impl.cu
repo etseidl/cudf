@@ -664,7 +664,7 @@ class aggregate_reader_metadata {
     // first pass, find matching row groups/pages for range, and get lower and upper
     // bounds on rows needed per file
     for (size_t src_idx = 0; src_idx < per_file_metadata.size(); ++src_idx) {
-      auto const& fmd = per_file_metadata[src_idx];
+      auto const& fmd   = per_file_metadata[src_idx];
       int64_t start_row = 0;  // start row for the row group
 
       for (size_t rg_idx = 0; rg_idx < fmd.row_groups.size(); ++rg_idx) {
@@ -678,12 +678,12 @@ class aggregate_reader_metadata {
         bool res = rdr.read(&stats);
         CUDF_EXPECTS(res, "Cannot parse statistics.");
 
-        //range.print();
-        //printf("test rg %ld (", rg_idx);
-        //print_vector(stats.min_value);
-        //printf(", ");
-        //print_vector(stats.max_value);
-        //printf(")\n");
+        // range.print();
+        // printf("test rg %ld (", rg_idx);
+        // print_vector(stats.min_value);
+        // printf(", ");
+        // print_vector(stats.max_value);
+        // printf(")\n");
 
         if (range.range_matches(stats.min_value, stats.max_value)) {
           row_group_page_info rgi(rg_idx, start_row, src_idx);
@@ -695,12 +695,14 @@ class aggregate_reader_metadata {
           // allocate space for column_info...populate key column on this pass,
           // other columns later
           rgi.chunks.resize(rg.columns.size());
-          auto& key_chunk_info = rgi.chunks[range.key_column()];
+          auto& key_chunk_info             = rgi.chunks[range.key_column()];
           key_chunk_info.dictionary_offset = key_chunk.meta_data.dictionary_page_offset;
-          key_chunk_info.dictionary_size = key_chunk_info.dictionary_offset ?
-                offidx.page_locations[0].offset - key_chunk_info.dictionary_offset : 0;
+          key_chunk_info.dictionary_size =
+            key_chunk_info.dictionary_offset
+              ? offidx.page_locations[0].offset - key_chunk_info.dictionary_offset
+              : 0;
 
-          int64_t local_low_row = INT64_MAX;
+          int64_t local_low_row  = INT64_MAX;
           int64_t local_high_row = 0;
 
           auto num_pages = colidx.null_pages.size();
@@ -709,48 +711,52 @@ class aggregate_reader_metadata {
             if (colidx.null_pages[pg_idx]) continue;
 
             if (range.range_matches(colidx.min_values[pg_idx], colidx.max_values[pg_idx])) {
-              //printf("adding [");
-              //print_vector(colidx.min_values[pg_idx]);
-              //printf(",  ");
-              //print_vector(colidx.max_values[pg_idx]);
-              //printf(")\n");
-              
+              // printf("adding [");
+              // print_vector(colidx.min_values[pg_idx]);
+              // printf(",  ");
+              // print_vector(colidx.max_values[pg_idx]);
+              // printf(")\n");
+
               auto const page_loc = offidx.page_locations[pg_idx];
 
               auto const pg_start_row = page_loc.first_row_index;
-              auto const pg_end_row = pg_idx == (num_pages - 1) ?
-                              rg.num_rows : offidx.page_locations[pg_idx + 1].first_row_index;
+              auto const pg_end_row   = pg_idx == (num_pages - 1)
+                                          ? rg.num_rows
+                                          : offidx.page_locations[pg_idx + 1].first_row_index;
 
-              local_low_row = std::min(local_low_row, pg_start_row);
+              local_low_row  = std::min(local_low_row, pg_start_row);
               local_high_row = std::max(local_high_row, pg_end_row);
 
               key_chunk_info.pages.push_back(page_loc);
             }
           }
 
-          //printf("low %ld high %ld\n", local_low_row, local_high_row);
+          // printf("low %ld high %ld\n", local_low_row, local_high_row);
 
           // now full in column info for the rest of the columns
           for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
             if (col_idx == static_cast<size_t>(range.key_column())) { continue; }
 
             auto const& chunk = rg.columns[col_idx];
-            auto& chunk_info = rgi.chunks[col_idx];
+            auto& chunk_info  = rgi.chunks[col_idx];
 
             auto const idx_idx = rg_idx * rg.columns.size() + col_idx;
             auto const& offidx = fmd.offset_indexes[idx_idx];
 
             chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
-            chunk_info.dictionary_size = chunk_info.dictionary_offset ?
-                offidx.page_locations[0].offset - chunk_info.dictionary_offset : 0;
+            chunk_info.dictionary_size =
+              chunk_info.dictionary_offset
+                ? offidx.page_locations[0].offset - chunk_info.dictionary_offset
+                : 0;
 
             for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
-              auto const page_loc = offidx.page_locations[pg_idx];
+              auto const page_loc     = offidx.page_locations[pg_idx];
               auto const pg_start_row = page_loc.first_row_index;
-              auto const pg_end_row = pg_idx == (num_pages - 1) ?
-                              rg.num_rows : offidx.page_locations[pg_idx + 1].first_row_index;
+              auto const pg_end_row   = pg_idx == (num_pages - 1)
+                                          ? rg.num_rows
+                                          : offidx.page_locations[pg_idx + 1].first_row_index;
               if (pg_start_row < local_high_row && pg_end_row > local_low_row) {
-                //printf("adding col %ld (%ld, %ld)\n", col_idx, pg_start_row, pg_end_row);
+                // printf("adding col %ld (%ld, %ld)\n", col_idx, pg_start_row, pg_end_row);
                 chunk_info.pages.push_back(page_loc);
               }
             }
@@ -2004,10 +2010,15 @@ table_with_metadata range_reader::impl::read()
     for (size_t col_idx = 0; col_idx < rgi.chunks.size(); col_idx++) {
       auto const& col = rgi.chunks[col_idx];
       printf("    col %ld, dict offset %ld, dict size %ld, npages %ld\n",
-        col_idx, col.dictionary_offset, col.dictionary_size, col.pages.size());
+             col_idx,
+             col.dictionary_offset,
+             col.dictionary_size,
+             col.pages.size());
       for (auto const pg : col.pages) {
         printf("      offset %ld, size %d, start row %ld\n",
-               pg.offset, pg.compressed_page_size, pg.first_row_index);
+               pg.offset,
+               pg.compressed_page_size,
+               pg.first_row_index);
       }
     }
   }
