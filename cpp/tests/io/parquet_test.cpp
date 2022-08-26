@@ -4438,7 +4438,7 @@ TEST_P(ParquetSizedTest, DictionaryTest)
 
 TEST_F(ParquetReaderTest, RangeReaderTest)
 {
-  constexpr auto num_rows = 10'000'000;
+  constexpr auto num_rows = 3'000'000;
 
   // fixed length strings
   auto str1_elements = cudf::detail::make_counting_transform_iterator(0, [](auto i) {
@@ -4482,7 +4482,7 @@ TEST_F(ParquetReaderTest, RangeReaderTest)
     cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
 
   constexpr cudf::size_type key_col = 0;
-  cudf::io::parquet_range range(key_col, std::string{"000000030000"}, std::string{"000000070000"});
+  cudf::io::parquet_range range(key_col, std::string{"000000960000"}, std::string{"000001070000"});
   auto const result = cudf::io::read_parquet(default_in_opts, range);
 }
 
