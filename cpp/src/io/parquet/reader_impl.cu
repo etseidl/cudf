@@ -321,7 +321,47 @@ struct metadata : public FileMetaData {
     CompactProtocolReader cp(buffer->data(), ender->footer_len);
     CUDF_EXPECTS(cp.read(this), "Cannot parse metadata");
     CUDF_EXPECTS(cp.InitSchema(this), "Cannot initialize schema");
+
+    // TODO(ets): terminate early if no index info.  check bounds on row_groups and columns.
+    // not sure if page indexes can be turned off per column or not
+    bool has_column_index = false;
+    for (auto const& rg : row_groups) {
+      for (auto const& col : rg.columns) {
+        if (col.offset_index_offset > 0) {
+          const auto buf = source->host_read(col.offset_index_offset, col.offset_index_length);
+          cp.init(buf->data(), buf->size());
+          OffsetIndex oi;
+          CUDF_EXPECTS(cp.read(&oi), "Cannot parse offset index");
+          offset_indexes.push_back(std::move(oi));
+          has_column_index = true;
+        } else {
+          // push empty offset index in case only certain columns have an index
+          OffsetIndex oi;
+          offset_indexes.push_back(std::move(oi));
+        }
+        if (col.column_index_offset > 0) {
+          const auto buf = source->host_read(col.column_index_offset, col.column_index_length);
+          cp.init(buf->data(), buf->size());
+          ColumnIndex ci;
+          CUDF_EXPECTS(cp.read(&ci), "Cannot parse offset index");
+          column_indexes.push_back(std::move(ci));
+          has_column_index = true;
+        } else {
+          // push empty column index in case only certain columns have an index
+          ColumnIndex ci;
+          column_indexes.push_back(std::move(ci));
+        }
+      }
+    }
+
+    if (!has_column_index) {
+      offset_indexes.clear();
+      column_indexes.clear();
+    }
   }
+
+  std::vector<OffsetIndex> offset_indexes;
+  std::vector<ColumnIndex> column_indexes;
 };
 
 class aggregate_reader_metadata {
