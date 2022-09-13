@@ -1162,12 +1162,12 @@ std::future<void> reader::impl::read_column_chunks(
       chunk_meta_idx++;
     } else {
       const size_t io_offset   = column_chunk_offsets[chunk_meta_idx];
-      size_t io_size           = chunks[chunk].compressed_size + chunks[chunk].dictionary_size;
+      size_t io_size           = chunks[chunk].compressed_size;
       size_t next_chunk        = chunk + 1;
       const bool is_compressed = (chunks[chunk].codec != parquet::Compression::UNCOMPRESSED);
-      auto l_chunk_meta_idx    = chunk_meta_idx;
+      auto l_chunk_meta_idx    = chunk_meta_idx + 1;
       while (next_chunk < end_chunk) {
-        const size_t next_offset = column_chunk_offsets[l_chunk_meta_idx + 1];
+        const size_t next_offset = column_chunk_offsets[l_chunk_meta_idx];
         const bool is_next_compressed =
           (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
         const bool is_next_contiguous = chunks[next_chunk].is_contiguous;
@@ -1177,7 +1177,7 @@ std::future<void> reader::impl::read_column_chunks(
           // freed earlier (immediately after decompression stage) to limit peak memory requirements
           break;
         }
-        io_size += chunks[next_chunk].compressed_size + chunks[next_chunk].dictionary_size;
+        io_size += chunks[next_chunk].compressed_size;
         next_chunk++;
         l_chunk_meta_idx++;
       }
@@ -1202,7 +1202,7 @@ std::future<void> reader::impl::read_column_chunks(
       } else {
         chunk = next_chunk;
       }
-      chunk_meta_idx++;
+      chunk_meta_idx = l_chunk_meta_idx;
     }
   }
   auto sync_fn = [](decltype(read_tasks) read_tasks) {
@@ -1855,8 +1855,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                           schema.type_length);
 
         size_type compressed_size;
-        size_type dict_size =
-          col_meta.dictionary_page_offset ? col_meta.data_page_offset - col_meta.dictionary_page_offset : 0;
+        size_type dict_size;
 
         bool is_contiguous = true;
         if (uses_custom_row_bounds && rg.has_page_index()) {
@@ -1872,9 +1871,12 @@ table_with_metadata reader::impl::read(size_type skip_rows,
           }
             
           column_chunk_offsets[chunk_idx] = col_info.pages[0].location.offset;
+          dict_size =
+            col_meta.dictionary_page_offset ? col_meta.data_page_offset - col_meta.dictionary_page_offset : 0;
         } else {
-          compressed_size = col_meta.total_compressed_size - dict_size;
-          column_chunk_offsets[chunk_idx] =
+          dict_size = 0;
+          compressed_size = col_meta.total_compressed_size;
+          column_chunk_offsets[chunks.size()] =
             col_meta.dictionary_page_offset
               ? std::min(col_meta.data_page_offset, col_meta.dictionary_page_offset)
               : col_meta.data_page_offset;
