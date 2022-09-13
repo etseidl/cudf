@@ -568,10 +568,33 @@ class aggregate_reader_metadata {
     return names;
   }
 
+
+  // FIXME(ets)
+  // wants:
+  //   need for each source file:
+  //     needed row groups
+  //       src_file_index
+  //       start_row
+  //       column_info for each column requested
+  //         dict_offset
+  //         num_data_pages
+  //         for each data page
+  //           page_location (offset, start_idx (rel to row group), compressed_size)
+  //           num_values (from page header, deferred: do future stuff to read pages then get this
+  //           info)
+  //
+  //
+  struct column_info {
+    uint64_t dictionary_offset;
+    uint64_t dictionary_size;
+    std::vector<PageLocation> pages;
+  };
+
   struct row_group_info {
     size_type const index;
     size_t const start_row;  // TODO source index
     size_type const source_index;
+    std::vector<column_info> chunks;
     row_group_info(size_type index, size_t start_row, size_type source_index)
       : index(index), start_row(start_row), source_index(source_index)
     {
@@ -610,6 +633,9 @@ class aggregate_reader_metadata {
       return selection;
     }
 
+    // TODO(ets): does it make sense to have start_row across multiple files?
+    bool const uses_custom_row_bounds = row_start != 0  || row_count >= 0;
+
     row_start = std::max(row_start, 0);
     if (row_count < 0) {
       row_count = static_cast<size_type>(
@@ -622,11 +648,66 @@ class aggregate_reader_metadata {
     std::vector<row_group_info> selection;
     size_type count = 0;
     for (size_t src_idx = 0; src_idx < per_file_metadata.size(); ++src_idx) {
-      for (size_t rg_idx = 0; rg_idx < per_file_metadata[src_idx].row_groups.size(); ++rg_idx) {
+      auto const& fmd   = per_file_metadata[src_idx];
+
+      for (size_t rg_idx = 0; rg_idx < fmd.row_groups.size(); ++rg_idx) {
+        auto const& rg         = fmd.row_groups[rg_idx];
+
         auto const chunk_start_row = count;
-        count += get_row_group(rg_idx, src_idx).num_rows;
+        count += rg.num_rows;
         if (count > row_start || count == 0) {
-          selection.emplace_back(rg_idx, chunk_start_row, src_idx);
+          row_group_info rgi(rg_idx, chunk_start_row, src_idx);
+
+          // if using custom bounds, then figure out list of pages to read
+          // but don't bother if reading every page in the row group
+          bool use_whole_rg = chunk_start_row >= row_start && count <= (row_start + row_count);
+
+          if (uses_custom_row_bounds && fmd.offset_indexes.size() > 0 && !use_whole_rg) {
+            rgi.chunks.resize(rg.columns.size());
+
+            //printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
+
+            // now fill in column info for pages that intersect the range
+            // [row_start, row_start + row_count)
+            for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
+              auto const& chunk  = rg.columns[col_idx];
+              auto& chunk_info   = rgi.chunks[col_idx];
+              auto const idx_idx = rg_idx * rg.columns.size() + col_idx;
+              auto const& offidx = fmd.offset_indexes[idx_idx];
+              auto num_pages     = offidx.page_locations.size();
+
+              auto range_matches = [&, row_start, row_end = row_start + row_count](size_t idx) {
+                auto const& page_loc    = offidx.page_locations[idx];
+                auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
+                auto const pg_end_row   = chunk_start_row + (idx == (num_pages - 1)
+                                            ? rg.num_rows
+                                            : offidx.page_locations[idx + 1].first_row_index);
+                return row_start < pg_end_row && row_end > pg_start_row;
+              };
+
+              chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
+              chunk_info.dictionary_size = chunk_info.dictionary_offset ?
+                chunk.meta_data.data_page_offset - chunk_info.dictionary_offset
+                : 0;
+
+              bool use_whole_chunk = num_pages == 1 || (range_matches(0) && range_matches(num_pages - 1));
+
+              if (!use_whole_chunk) {
+                for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
+                  if (range_matches(pg_idx)) {
+                    auto const& page_loc = offidx.page_locations[pg_idx];
+                    printf("adding col %ld %ld\n", col_idx, page_loc.first_row_index + chunk_start_row);
+                    chunk_info.pages.push_back(page_loc);
+                  }
+                }
+              } //else {
+                //printf("whole column chunk %d %d\n", chunk_start_row, count);
+              //}
+            }
+          } //else if (uses_custom_row_bounds) {
+            //printf("whole row group %d %d\n", chunk_start_row, count);
+          //}
+          selection.emplace_back(rgi);
         }
         if (count >= row_start + row_count) { break; }
       }
