@@ -98,7 +98,8 @@ class reader::impl {
                                        size_t begin_chunk,
                                        size_t end_chunk,
                                        const std::vector<size_t>& column_chunk_offsets,
-                                       std::vector<size_type> const& chunk_source_map);
+                                       std::vector<size_type> const& chunk_source_map,
+                                       size_t chunk_meta_idx);
 
   /**
    * @brief Returns the number of total pages from the given column chunks

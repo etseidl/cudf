@@ -584,10 +584,20 @@ class aggregate_reader_metadata {
   //           info)
   //
   //
+  struct page_info {
+    PageLocation location;
+    int64_t num_rows;
+    int64_t num_nulls;
+  };
+
   struct column_info {
-    uint64_t dictionary_offset;
-    uint64_t dictionary_size;
-    std::vector<PageLocation> pages;
+    int64_t dictionary_offset;
+    int32_t dictionary_size;
+    std::vector<page_info> pages;
+
+    constexpr bool is_contiguous() const {
+      return !dictionary_offset || dictionary_offset + dictionary_size == pages[0].location.offset;
+    }
   };
 
   struct row_group_info {
@@ -599,6 +609,8 @@ class aggregate_reader_metadata {
       : index(index), start_row(start_row), source_index(source_index)
     {
     }
+
+    bool has_page_index() const { return chunks.size() > 0; }
   };
 
   /**
@@ -633,9 +645,6 @@ class aggregate_reader_metadata {
       return selection;
     }
 
-    // TODO(ets): does it make sense to have start_row across multiple files?
-    bool const uses_custom_row_bounds = row_start != 0  || row_count >= 0;
-
     row_start = std::max(row_start, 0);
     if (row_count < 0) {
       row_count = static_cast<size_type>(
@@ -658,11 +667,9 @@ class aggregate_reader_metadata {
         if (count > row_start || count == 0) {
           row_group_info rgi(rg_idx, chunk_start_row, src_idx);
 
-          // if using custom bounds, then figure out list of pages to read
-          // but don't bother if reading every page in the row group
-          bool use_whole_rg = chunk_start_row >= row_start && count <= (row_start + row_count);
-
-          if (uses_custom_row_bounds && fmd.offset_indexes.size() > 0 && !use_whole_rg) {
+          // if page-level indexes are present, then collect extra chunk and page
+          // info. if using custom bounds, then figure out which pages to read
+          if (fmd.offset_indexes.size() > 0 && fmd.column_indexes.size() > 0) {
             rgi.chunks.resize(rg.columns.size());
 
             //printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
@@ -674,39 +681,31 @@ class aggregate_reader_metadata {
               auto& chunk_info   = rgi.chunks[col_idx];
               auto const idx_idx = rg_idx * rg.columns.size() + col_idx;
               auto const& offidx = fmd.offset_indexes[idx_idx];
+              auto const& colidx = fmd.column_indexes[idx_idx];
               auto num_pages     = offidx.page_locations.size();
-
-              auto range_matches = [&, row_start, row_end = row_start + row_count](size_t idx) {
-                auto const& page_loc    = offidx.page_locations[idx];
-                auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
-                auto const pg_end_row   = chunk_start_row + (idx == (num_pages - 1)
-                                            ? rg.num_rows
-                                            : offidx.page_locations[idx + 1].first_row_index);
-                return row_start < pg_end_row && row_end > pg_start_row;
-              };
 
               chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
               chunk_info.dictionary_size = chunk_info.dictionary_offset ?
                 chunk.meta_data.data_page_offset - chunk_info.dictionary_offset
                 : 0;
 
-              bool use_whole_chunk = num_pages == 1 || (range_matches(0) && range_matches(num_pages - 1));
+              auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start, size_type pg_end) {
+                return row_start < pg_end && row_end > pg_start;
+              };
 
-              if (!use_whole_chunk) {
-                for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
-                  if (range_matches(pg_idx)) {
-                    auto const& page_loc = offidx.page_locations[pg_idx];
-                    printf("adding col %ld %ld\n", col_idx, page_loc.first_row_index + chunk_start_row);
-                    chunk_info.pages.push_back(page_loc);
-                  }
+              for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
+                auto const& page_loc    = offidx.page_locations[pg_idx];
+                auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
+                auto const pg_end_row   = chunk_start_row + (pg_idx == (num_pages - 1)
+                                          ? rg.num_rows
+                                          : offidx.page_locations[pg_idx + 1].first_row_index);
+                if (range_matches(pg_start_row, pg_end_row)) {
+                  //printf("adding col %ld %ld %ld\n", col_idx, pg_start_row, pg_end_row);
+                  chunk_info.pages.push_back(page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
                 }
-              } //else {
-                //printf("whole column chunk %d %d\n", chunk_start_row, count);
-              //}
+              }
             }
-          } //else if (uses_custom_row_bounds) {
-            //printf("whole row group %d %d\n", chunk_start_row, count);
-          //}
+          }
           selection.emplace_back(rgi);
         }
         if (count >= row_start + row_count) { break; }
@@ -1111,48 +1110,99 @@ std::future<void> reader::impl::read_column_chunks(
   size_t begin_chunk,
   size_t end_chunk,
   const std::vector<size_t>& column_chunk_offsets,
-  std::vector<size_type> const& chunk_source_map)
+  std::vector<size_type> const& chunk_source_map,
+  size_t chunk_meta_idx)
 {
   // Transfer chunk data, coalescing adjacent chunks
   std::vector<std::future<size_t>> read_tasks;
   for (size_t chunk = begin_chunk; chunk < end_chunk;) {
-    const size_t io_offset   = column_chunk_offsets[chunk];
-    size_t io_size           = chunks[chunk].compressed_size;
-    size_t next_chunk        = chunk + 1;
-    const bool is_compressed = (chunks[chunk].codec != parquet::Compression::UNCOMPRESSED);
-    while (next_chunk < end_chunk) {
-      const size_t next_offset = column_chunk_offsets[next_chunk];
-      const bool is_next_compressed =
-        (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
-      if (next_offset != io_offset + io_size || is_next_compressed != is_compressed) {
-        // Can't merge if not contiguous or mixing compressed and uncompressed
-        // Not coalescing uncompressed with compressed chunks is so that compressed buffers can be
-        // freed earlier (immediately after decompression stage) to limit peak memory requirements
-        break;
+    // if dictionary and page data are split in this chunk, read the dictionary separately.
+    // we could possibly read the dictionary for the next chunk with the data for this one,
+    // but that gets complicated.  for now just do a little extra I/O
+    // is_contiguous is only false if there is a dictionary.
+    if (not chunks[chunk].is_contiguous) {
+      size_t io_offset = column_chunk_offsets[chunk_meta_idx];
+      size_t io_size   = chunks[chunk].dictionary_size;
+      if (io_size != 0) {
+        auto& source = _sources[chunk_source_map[chunk]];
+        if (source->is_device_read_preferred(io_size)) {
+          auto buffer        = rmm::device_buffer(io_size, _stream);
+          auto fut_read_size = source->device_read_async(
+            io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
+          read_tasks.emplace_back(std::move(fut_read_size));
+          page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
+        } else {
+          auto const buffer = source->host_read(io_offset, io_size);
+          page_data[chunk_meta_idx] =
+            datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
+        }
+        chunks[chunk].dictionary_data = page_data[chunk_meta_idx]->data();
       }
-      io_size += chunks[next_chunk].compressed_size;
-      next_chunk++;
-    }
-    if (io_size != 0) {
-      auto& source = _sources[chunk_source_map[chunk]];
-      if (source->is_device_read_preferred(io_size)) {
-        auto buffer        = rmm::device_buffer(io_size, _stream);
-        auto fut_read_size = source->device_read_async(
-          io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
-        read_tasks.emplace_back(std::move(fut_read_size));
-        page_data[chunk] = datasource::buffer::create(std::move(buffer));
-      } else {
-        auto const buffer = source->host_read(io_offset, io_size);
-        page_data[chunk] =
-          datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
+
+      // now read page data
+      io_offset = column_chunk_offsets[++chunk_meta_idx];
+      io_size   = chunks[chunk].compressed_size;
+      if (io_size != 0) {
+        auto& source = _sources[chunk_source_map[chunk]];
+        if (source->is_device_read_preferred(io_size)) {
+          auto buffer        = rmm::device_buffer(io_size, _stream);
+          auto fut_read_size = source->device_read_async(
+            io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
+          read_tasks.emplace_back(std::move(fut_read_size));
+          page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
+        } else {
+          auto const buffer = source->host_read(io_offset, io_size);
+          page_data[chunk_meta_idx] =
+            datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
+        }
+        chunks[chunk].compressed_data = page_data[chunk_meta_idx]->data();
       }
-      auto d_compdata = page_data[chunk]->data();
-      do {
-        chunks[chunk].compressed_data = d_compdata;
-        d_compdata += chunks[chunk].compressed_size;
-      } while (++chunk != next_chunk);
+
+      chunk++;
+      chunk_meta_idx++;
     } else {
-      chunk = next_chunk;
+      const size_t io_offset   = column_chunk_offsets[chunk_meta_idx];
+      size_t io_size           = chunks[chunk].compressed_size + chunks[chunk].dictionary_size;
+      size_t next_chunk        = chunk + 1;
+      const bool is_compressed = (chunks[chunk].codec != parquet::Compression::UNCOMPRESSED);
+      auto l_chunk_meta_idx    = chunk_meta_idx;
+      while (next_chunk < end_chunk) {
+        const size_t next_offset = column_chunk_offsets[l_chunk_meta_idx + 1];
+        const bool is_next_compressed =
+          (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
+        const bool is_next_contiguous = chunks[next_chunk].is_contiguous;
+        if (!is_next_contiguous || next_offset != io_offset + io_size || is_next_compressed != is_compressed) {
+          // Can't merge if not contiguous or mixing compressed and uncompressed
+          // Not coalescing uncompressed with compressed chunks is so that compressed buffers can be
+          // freed earlier (immediately after decompression stage) to limit peak memory requirements
+          break;
+        }
+        io_size += chunks[next_chunk].compressed_size + chunks[next_chunk].dictionary_size;
+        next_chunk++;
+        l_chunk_meta_idx++;
+      }
+      if (io_size != 0) {
+        auto& source = _sources[chunk_source_map[chunk]];
+        if (source->is_device_read_preferred(io_size)) {
+          auto buffer        = rmm::device_buffer(io_size, _stream);
+          auto fut_read_size = source->device_read_async(
+            io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
+          read_tasks.emplace_back(std::move(fut_read_size));
+          page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
+        } else {
+          auto const buffer = source->host_read(io_offset, io_size);
+          page_data[chunk_meta_idx] =
+            datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
+        }
+        auto d_compdata = page_data[chunk_meta_idx]->data();
+        do {
+          chunks[chunk].compressed_data = d_compdata;
+          d_compdata += chunks[chunk].compressed_size;
+        } while (++chunk != next_chunk);
+      } else {
+        chunk = next_chunk;
+      }
+      chunk_meta_idx++;
     }
   }
   auto sync_fn = [](decltype(read_tasks) read_tasks) {
@@ -1748,14 +1798,28 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     const auto num_chunks        = selected_row_groups.size() * num_input_columns;
     hostdevice_vector<gpu::ColumnChunkDesc> chunks(0, num_chunks, _stream);
 
+    // if using custom bounds, need to account for non-contiguous dictionary
+    // pages
+    int num_extra_pages = 0;
+    if (uses_custom_row_bounds) {
+      for (auto const& rg : selected_row_groups) {
+        if (rg.has_page_index()) {
+          thrust::for_each(rg.chunks.begin(), rg.chunks.end(),
+            [&](aggregate_reader_metadata::column_info const& chunk) {
+              if (not chunk.is_contiguous()) { num_extra_pages++; }
+            });
+        }
+      }
+    }
+
     // Association between each column chunk and its source
     std::vector<size_type> chunk_source_map(num_chunks);
 
     // Tracker for eventually deallocating compressed and uncompressed data
-    std::vector<std::unique_ptr<datasource::buffer>> page_data(num_chunks);
+    std::vector<std::unique_ptr<datasource::buffer>> page_data(num_chunks + num_extra_pages);
 
     // Keep track of column chunk file offsets
-    std::vector<size_t> column_chunk_offsets(num_chunks);
+    std::vector<size_t> column_chunk_offsets(num_chunks + num_extra_pages);
 
     // if there are lists present, we need to preprocess
     bool has_lists = false;
@@ -1763,6 +1827,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     // Initialize column chunk information
     size_t total_decompressed_size = 0;
     auto remaining_rows            = num_rows;
+    size_t chunk_idx               = 0;
     std::vector<std::future<void>> read_rowgroup_tasks;
     for (const auto& rg : selected_row_groups) {
       const auto& row_group       = _metadata->get_row_group(rg.index, rg.source_index);
@@ -1770,6 +1835,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       auto const row_group_source = rg.source_index;
       auto const row_group_rows   = std::min<int>(remaining_rows, row_group.num_rows);
       auto const io_chunk_idx     = chunks.size();
+      auto const start_chunk_idx  = chunk_idx;
 
       // generate ColumnChunkDesc objects for everything to be decoded (all input columns)
       for (size_t i = 0; i < num_input_columns; ++i) {
@@ -1788,13 +1854,37 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                           schema.converted_type,
                           schema.type_length);
 
-        column_chunk_offsets[chunks.size()] =
-          (col_meta.dictionary_page_offset != 0)
-            ? std::min(col_meta.data_page_offset, col_meta.dictionary_page_offset)
-            : col_meta.data_page_offset;
+        size_type compressed_size;
+        size_type dict_size =
+          col_meta.dictionary_page_offset ? col_meta.data_page_offset - col_meta.dictionary_page_offset : 0;
 
-        chunks.push_back(gpu::ColumnChunkDesc(col_meta.total_compressed_size,
+        bool is_contiguous = true;
+        if (uses_custom_row_bounds && rg.has_page_index()) {
+          auto const& col_info = rg.chunks[col.schema_idx];
+          auto size_input = thrust::make_transform_iterator(
+            col_info.pages.begin(), [] (aggregate_reader_metadata::page_info const& page) {
+              return page.location.compressed_page_size;
+            });
+          compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
+          if (col_info.dictionary_offset && not col_info.is_contiguous()) {
+            column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
+            is_contiguous = false;
+          }
+            
+          column_chunk_offsets[chunk_idx] = col_info.pages[0].location.offset;
+        } else {
+          compressed_size = col_meta.total_compressed_size - dict_size;
+          column_chunk_offsets[chunk_idx] =
+            col_meta.dictionary_page_offset
+              ? std::min(col_meta.data_page_offset, col_meta.dictionary_page_offset)
+              : col_meta.data_page_offset;
+        }
+
+        chunks.push_back(gpu::ColumnChunkDesc(dict_size,
                                               nullptr,
+                                              compressed_size,
+                                              nullptr,
+                                              is_contiguous,
                                               col_meta.num_values,
                                               schema.type,
                                               type_width,
@@ -1817,12 +1907,15 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         chunk_source_map[chunks.size() - 1] = row_group_source;
 
         if (col_meta.codec != Compression::UNCOMPRESSED) {
+          // doesn't need to be exact, just used to indicate the presence of compressed pages
           total_decompressed_size += col_meta.total_uncompressed_size;
         }
+
+        chunk_idx++;
       }
       // Read compressed chunk data to device memory
       read_rowgroup_tasks.push_back(read_column_chunks(
-        page_data, chunks, io_chunk_idx, chunks.size(), column_chunk_offsets, chunk_source_map));
+        page_data, chunks, io_chunk_idx, chunks.size(), column_chunk_offsets, chunk_source_map, start_chunk_idx));
 
       remaining_rows -= row_group.num_rows;
     }
