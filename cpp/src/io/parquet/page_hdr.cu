@@ -357,6 +357,21 @@ __global__ void __launch_bounds__(128)
     PageInfo* page_info;
 
     if (!lane_id) {
+      // special case for split chunks
+      if (bs->ck.dictionary_data) {
+        bs->base = bs->cur      = bs->ck.dictionary_data;
+        bs->end                 = bs->base + bs->ck.dictionary_size;
+        if (parse_page_header(bs)) {
+          if (bs->page_type != PageType::DICTIONARY_PAGE) {
+            CUDF_UNREACHABLE("Expected dictionary page");
+          }
+          bs->page.flags = PAGEINFO_FLAGS_DICTIONARY;
+          bs->page.page_data = const_cast<uint8_t*>(bs->cur);
+          if (bs->ck.page_info) { bs->ck.page_info[0] = bs->page; }
+          dictionary_page_count++;
+        }
+      }
+
       bs->base = bs->cur      = bs->ck.compressed_data;
       bs->end                 = bs->base + bs->ck.compressed_size;
       bs->page.chunk_idx      = chunk;

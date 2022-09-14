@@ -1811,6 +1811,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         }
       }
     }
+    printf("read:num_extra_pages %d\n", num_extra_pages);
 
     // Association between each column chunk and its source
     std::vector<size_type> chunk_source_map(num_chunks);
@@ -1859,20 +1860,39 @@ table_with_metadata reader::impl::read(size_type skip_rows,
 
         bool is_contiguous = true;
         if (uses_custom_row_bounds && rg.has_page_index()) {
-          auto const& col_info = rg.chunks[col.schema_idx];
-          auto size_input = thrust::make_transform_iterator(
-            col_info.pages.begin(), [] (aggregate_reader_metadata::page_info const& page) {
-              return page.location.compressed_page_size;
-            });
-          compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
-          if (col_info.dictionary_offset && not col_info.is_contiguous()) {
-            column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
-            is_contiguous = false;
+          // translate schema_idx into something we can use
+          int colidx = 0;
+          for (auto const& colchunk : _metadata->get_row_group(rg.index, rg.source_index).columns) {
+            if (colchunk.schema_idx == col.schema_idx) { break; }
+            colidx++;
           }
-            
-          column_chunk_offsets[chunk_idx] = col_info.pages[0].location.offset;
-          dict_size =
-            col_meta.dictionary_page_offset ? col_meta.data_page_offset - col_meta.dictionary_page_offset : 0;
+
+          printf("hello i %ld schema %d colidx %d\n", i, col.schema_idx, colidx);
+
+          auto const& col_info = rg.chunks[colidx];
+          printf("  npages %ld\n", col_info.pages.size());
+          if (col_info.pages.size() == 0) {
+            dict_size = 0;
+            compressed_size = 0;
+          } else {
+            auto size_input = thrust::make_transform_iterator(
+              col_info.pages.begin(), [] (aggregate_reader_metadata::page_info const& page) {
+                return page.location.compressed_page_size;
+              });
+            compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
+            printf("  is contig %d\n", col_info.is_contiguous());
+            if (col_info.dictionary_offset && not col_info.is_contiguous()) {
+              column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
+              dict_size = col_info.dictionary_size;
+              is_contiguous = false;
+            } else {
+              dict_size = 0;
+              compressed_size += col_info.dictionary_size;
+              column_chunk_offsets[chunk_idx] = col_info.dictionary_offset ? 
+                col_info.dictionary_offset : col_info.pages[0].location.offset;
+            }
+          }
+          printf("compsz %d dictsz %d\n", compressed_size, dict_size);
         } else {
           dict_size = 0;
           compressed_size = col_meta.total_compressed_size;
@@ -1916,6 +1936,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         chunk_idx++;
       }
       // Read compressed chunk data to device memory
+      //printf("read rowgroups %ld %ld %ld\n", io_chunk_idx, start_chunk_idx, chunks.size());
       read_rowgroup_tasks.push_back(read_column_chunks(
         page_data, chunks, io_chunk_idx, chunks.size(), column_chunk_offsets, chunk_source_map, start_chunk_idx));
 
