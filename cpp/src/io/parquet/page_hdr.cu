@@ -307,7 +307,7 @@ struct gpuParseDataPageHeaderV2 {
   __device__ bool operator()(byte_stream_s* bs)
   {
     auto op = thrust::make_tuple(ParquetFieldInt32(1, bs->page.num_input_values),
-    P                            ParquetFieldInt32(2, bs->page.num_nulls),
+                                 ParquetFieldInt32(2, bs->page.num_nulls),
                                  ParquetFieldInt32(3, bs->page.num_rows),
                                  ParquetFieldEnum<Encoding>(4, bs->page.encoding),
                                  ParquetFieldInt32(5, bs->page.def_lvl_bytes),
