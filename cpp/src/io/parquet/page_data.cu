@@ -1858,7 +1858,7 @@ void PreprocessColumnData(hostdevice_vector<PageInfo>& pages,
         // number of rows we will allocate/read from the file with the amount specified in the
         // associated row group. This only applies to columns that are not children of lists as
         // those may have an arbitrary number of rows in them.
-        if (!uses_custom_row_bounds &&
+        if (/*!uses_custom_row_bounds &&*/
             !(out_buf.user_data & PARQUET_COLUMN_BUFFER_FLAG_HAS_LIST_PARENT) &&
             size > static_cast<size_type>(num_rows)) {
           size = static_cast<size_type>(num_rows);
