@@ -1248,6 +1248,9 @@ void reader::impl::decode_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& 
   chunks.host_to_device(_stream);
   gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
   pages.device_to_host(_stream, true);
+
+  // TODO(ets): fill in page_info num_null using page index if available
+  // not sure if it will ever be used though, so decide later
 }
 
 /**

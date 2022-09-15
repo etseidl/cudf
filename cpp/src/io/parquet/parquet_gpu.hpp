@@ -134,6 +134,9 @@ struct PageInfo {
   int32_t chunk_idx;       // column chunk this page belongs to
   int32_t src_col_schema;  // schema index of this column
   uint8_t flags;           // PAGEINFO_FLAGS_XXX
+  int32_t num_nulls;       // number of null values (V2 header)
+  int32_t def_lvl_bytes;   // length of the definition levels (V2 header)
+  int32_t rep_lvl_bytes;   // length of the repetition levels (V2 header)
   Encoding encoding;       // Encoding for data or dictionary page
   Encoding definition_level_encoding;  // Encoding used for definition levels (data page)
   Encoding repetition_level_encoding;  // Encoding used for repetition levels (data page)
