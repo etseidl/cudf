@@ -358,6 +358,9 @@ __global__ void __launch_bounds__(128)
     PageInfo* page_info;
 
     if (!lane_id) {
+      bs->page.chunk_idx      = chunk;
+      bs->page.src_col_schema = bs->ck.src_col_schema;
+
       // special case for split chunks
       if (bs->ck.dictionary_data) {
         bs->base = bs->cur      = bs->ck.dictionary_data;
@@ -366,17 +369,17 @@ __global__ void __launch_bounds__(128)
           if (bs->page_type != PageType::DICTIONARY_PAGE) {
             CUDF_UNREACHABLE("Expected dictionary page");
           }
-          bs->page.flags = PAGEINFO_FLAGS_DICTIONARY;
+          bs->page.chunk_row = 0;
+          bs->page.flags     = PAGEINFO_FLAGS_DICTIONARY;
           bs->page.page_data = const_cast<uint8_t*>(bs->cur);
           if (bs->ck.page_info) { bs->ck.page_info[0] = bs->page; }
           dictionary_page_count++;
         }
       }
 
-      bs->base = bs->cur      = bs->ck.compressed_data;
-      bs->end                 = bs->base + bs->ck.compressed_size;
-      bs->page.chunk_idx      = chunk;
-      bs->page.src_col_schema = bs->ck.src_col_schema;
+      bs->base = bs->cur = bs->ck.compressed_data;
+      bs->end            = bs->base + bs->ck.compressed_size;
+
       // this computation is only valid for flat schemas. for nested schemas,
       // they will be recomputed in the preprocess step by examining repetition and
       // definition levels
@@ -385,7 +388,6 @@ __global__ void __launch_bounds__(128)
     }
     num_values     = bs->ck.num_values;
     page_info      = bs->ck.page_info;
-    num_dict_pages = bs->ck.num_dict_pages;
     max_num_pages  = (page_info) ? bs->ck.max_num_pages : 0;
     values_found   = 0;
     __syncwarp();
@@ -393,10 +395,6 @@ __global__ void __launch_bounds__(128)
       int index_out = -1;
 
       if (lane_id == 0) {
-        // this computation is only valid for flat schemas. for nested schemas,
-        // they will be recomputed in the preprocess step by examining repetition and
-        // definition levels
-        bs->page.chunk_row += bs->page.num_rows;
         bs->page.num_rows = 0;
         if (parse_page_header(bs) && bs->page.compressed_page_size >= 0) {
           switch (bs->page_type) {
@@ -438,8 +436,14 @@ __global__ void __launch_bounds__(128)
         }
       }
       index_out = shuffle(index_out);
-      if (index_out >= 0 && index_out < max_num_pages && lane_id == 0)
-        page_info[index_out] = bs->page;
+      if (lane_id == 0) {
+        if (index_out >= 0 && index_out < max_num_pages) {
+          page_info[index_out] = bs->page;
+        }
+        // this will only be correct for flat schemas or V2 headers.
+        // need num_rows from page index if available
+        bs->page.chunk_row += bs->page.num_rows;
+      }
       num_values = shuffle(num_values);
       __syncwarp();
     }
