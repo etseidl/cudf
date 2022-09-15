@@ -409,7 +409,7 @@ __global__ void __launch_bounds__(128)
               // definition levels
               bs->page.num_rows = bs->page.num_input_values;
               // zero out V2 info
-              bs->page.num_null = 0;
+              bs->page.num_nulls = 0;
               bs->page.def_lvl_bytes = 0;
               bs->page.rep_lvl_bytes = 0;
               values_found += bs->page.num_input_values;
