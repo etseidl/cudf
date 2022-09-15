@@ -379,7 +379,7 @@ __global__ void __launch_bounds__(128)
       // this computation is only valid for flat schemas. for nested schemas,
       // they will be recomputed in the preprocess step by examining repetition and
       // definition levels
-      bs->page.chunk_row = 0;
+      bs->page.chunk_row = bs->ck.first_page_row;
       bs->page.num_rows  = 0;
     }
     num_values     = bs->ck.num_values;
@@ -399,6 +399,8 @@ __global__ void __launch_bounds__(128)
         bs->page.num_rows = 0;
         if (parse_page_header(bs) && bs->page.compressed_page_size >= 0) {
           switch (bs->page_type) {
+            // FIXME pagev2 handling is all wrong. skip the fallthrough and do
+            // each type of page header separately
             case PageType::DATA_PAGE:
               // this computation is only valid for flat schemas. for nested schemas,
               // they will be recomputed in the preprocess step by examining repetition and

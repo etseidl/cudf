@@ -1840,6 +1840,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
 
       // generate ColumnChunkDesc objects for everything to be decoded (all input columns)
       for (size_t i = 0; i < num_input_columns; ++i) {
+        size_t first_page_row = 0;
         auto col = _input_columns[i];
         // look up metadata
         auto& col_meta = _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
@@ -1880,7 +1881,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                 return page.location.compressed_page_size;
               });
             compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
-            printf("  is contig %d\n", col_info.is_contiguous());
+            printf("  is contig %d %ld\n", col_info.is_contiguous(), col_info.dictionary_offset);
             if (col_info.dictionary_offset && not col_info.is_contiguous()) {
               column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
               dict_size = col_info.dictionary_size;
@@ -1891,6 +1892,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
               column_chunk_offsets[chunk_idx] = col_info.dictionary_offset ? 
                 col_info.dictionary_offset : col_info.pages[0].location.offset;
             }
+
+            // override row_group_start and row_group_rows
+            first_page_row = col_info.pages[0].location.first_row_index;
           }
           printf("compsz %d dictsz %d\n", compressed_size, dict_size);
         } else {
@@ -1911,6 +1915,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                               schema.type,
                                               type_width,
                                               row_group_start,
+                                              first_page_row,
                                               row_group_rows,
                                               schema.max_definition_level,
                                               schema.max_repetition_level,
