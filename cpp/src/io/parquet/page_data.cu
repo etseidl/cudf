@@ -919,8 +919,12 @@ static __device__ bool setupLocalPageInfo(page_state_s* const s,
         s->first_row = 0;
       } else {
         s->first_row = (int32_t)min(min_row - page_start_row, (size_t)s->page.num_rows);
+        // TODO(ets): should we decrement num_rows by first_row here???
       }
       // # of rows within the page to output
+      // TODO(ets): is this correct?  if we're starting in the middle of a page, shouldn't
+      // num_rows be decremented by the number of skipped rows? or does that happen elsewhere?
+      // maybe doesn't matter for flat hierarchies?
       s->num_rows = s->page.num_rows;
       if ((page_start_row + s->first_row) + s->num_rows > min_row + num_rows) {
         s->num_rows =

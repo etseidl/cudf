@@ -1251,6 +1251,8 @@ void reader::impl::decode_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& 
 
   // TODO(ets): fill in page_info num_null using page index if available
   // not sure if it will ever be used though, so decide later
+  // can also fix page chunk_row as well, although it will be correct for
+  // flat and later corrected for nested, so ???
 }
 
 /**
@@ -1533,8 +1535,8 @@ void reader::impl::preprocess_columns(hostdevice_vector<gpu::ColumnChunkDesc>& c
   // TODO : we should be selectively preprocessing only columns that have
   // lists in them instead of doing them all if even one contains lists.
 
-  // if there are no lists, simply allocate every allocate every output
-  // column to be of size num_rows
+  // if there are no lists, simply allocate every output column to be of
+  // size num_rows
   if (!has_lists) {
     std::function<void(std::vector<column_buffer>&)> create_columns =
       [&](std::vector<column_buffer>& cols) {
@@ -1967,6 +1969,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         decomp_page_data = decompress_page_data(chunks, pages);
         // Free compressed data
         for (size_t c = 0; c < chunks.size(); c++) {
+          // FIXME(ets): need to check for discontiguous page dictionaries
           if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) { page_data[c].reset(); }
         }
       }
