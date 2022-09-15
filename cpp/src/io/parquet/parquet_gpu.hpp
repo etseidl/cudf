@@ -173,6 +173,7 @@ struct ColumnChunkDesc {
                            uint16_t datatype_,
                            uint16_t datatype_length_,
                            size_t start_row_,
+                           size_t first_page_row_,
                            uint32_t num_rows_,
                            int16_t max_definition_level_,
                            int16_t max_repetition_level_,
@@ -193,6 +194,7 @@ struct ColumnChunkDesc {
       is_contiguous(is_contiguous_),
       num_values(num_values_),
       start_row(start_row_),
+      first_page_row(first_page_row_),
       num_rows(num_rows_),
       max_level{max_definition_level_, max_repetition_level_},
       max_nesting_depth{max_nesting_depth_},
@@ -222,6 +224,7 @@ struct ColumnChunkDesc {
   bool is_contiguous;                              // true if dictionary and data are contiguous
   size_t num_values;                               // total number of values in this column
   size_t start_row;                                // starting row of this chunk
+  size_t first_page_row;                           // row index of first page read in this chunk
   uint32_t num_rows;                               // number of rows in this chunk
   int16_t max_level[level_type::NUM_LEVEL_TYPES];  // max definition/repetition level
   int16_t max_nesting_depth;                       // max nesting depth of the output
