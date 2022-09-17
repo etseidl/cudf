@@ -253,7 +253,7 @@ __device__ void gpuDecodeStream(
       level_run -= batch_len * 2;
     }
     if (t < batch_len) {
-      int idx                                  = value_count + t;
+      int idx                    = value_count + t;
       output[rolling_index(idx)] = level_val;
     }
     batch_coded_count += batch_len;
@@ -470,9 +470,8 @@ inline __device__ void gpuOutputString(volatile page_state_s* s, int src_pos, vo
 
   if (s->dict_base) {
     // String dictionary
-    uint32_t dict_pos = (s->dict_bits > 0) ? s->dict_idx[rolling_index(src_pos)] *
-                                               sizeof(string_index_pair)
-                                           : 0;
+    uint32_t dict_pos =
+      (s->dict_bits > 0) ? s->dict_idx[rolling_index(src_pos)] * sizeof(string_index_pair) : 0;
     if (dict_pos < (uint32_t)s->dict_size) {
       const auto* src = reinterpret_cast<const string_index_pair*>(s->dict_base + dict_pos);
       ptr             = src->first;
@@ -709,8 +708,7 @@ __device__ void gpuOutputFixedLenByteArrayAsInt(volatile page_state_s* s, int sr
   uint32_t const dtype_len_in = s->dtype_len_in;
   uint8_t const* data         = s->dict_base ? s->dict_base : s->data_start;
   uint32_t const pos =
-    (s->dict_base ? ((s->dict_bits > 0) ? s->dict_idx[rolling_index(src_pos)] : 0)
-                  : src_pos) *
+    (s->dict_base ? ((s->dict_bits > 0) ? s->dict_idx[rolling_index(src_pos)] : 0) : src_pos) *
     dtype_len_in;
   uint32_t const dict_size = s->dict_size;
 

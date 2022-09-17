@@ -568,7 +568,6 @@ class aggregate_reader_metadata {
     return names;
   }
 
-
   // FIXME(ets)
   // wants:
   //   need for each source file:
@@ -595,7 +594,8 @@ class aggregate_reader_metadata {
     int32_t dictionary_size;
     std::vector<page_info> pages;
 
-    constexpr bool is_contiguous() const {
+    constexpr bool is_contiguous() const
+    {
       return !dictionary_offset || dictionary_offset + dictionary_size == pages[0].location.offset;
     }
   };
@@ -672,7 +672,7 @@ class aggregate_reader_metadata {
           if (fmd.offset_indexes.size() > 0 && fmd.column_indexes.size() > 0) {
             rgi.chunks.resize(rg.columns.size());
 
-            //printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
+            // printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
 
             // now fill in column info for pages that intersect the range
             // [row_start, row_start + row_count)
@@ -688,33 +688,39 @@ class aggregate_reader_metadata {
               // see if data_page_offset differs from first entry in offsets index
               if (chunk.meta_data.dictionary_page_offset) {
                 chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
-                chunk_info.dictionary_size = chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
+                chunk_info.dictionary_size =
+                  chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
               } else {
-                if (num_pages && chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
+                if (num_pages &&
+                    chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
                   chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
-                  chunk_info.dictionary_size = offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
+                  chunk_info.dictionary_size =
+                    offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
                   // fix metadata too just in case. not working through const
-                  //chunk.meta_data.dictionary_page_offset = chunk.meta_data.data_page_offset;
-                  //chunk.meta_data.data_page_offset = offidx.page_locations[0].offset;
+                  // chunk.meta_data.dictionary_page_offset = chunk.meta_data.data_page_offset;
+                  // chunk.meta_data.data_page_offset = offidx.page_locations[0].offset;
                 } else {
                   chunk_info.dictionary_offset = 0;
-                  chunk_info.dictionary_size = 0;
+                  chunk_info.dictionary_size   = 0;
                 }
               }
 
-              auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start, size_type pg_end) {
+              auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start,
+                                                                                size_type pg_end) {
                 return row_start < pg_end && row_end > pg_start;
               };
 
               for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
                 auto const& page_loc    = offidx.page_locations[pg_idx];
                 auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
-                auto const pg_end_row   = chunk_start_row + (pg_idx == (num_pages - 1)
-                                          ? rg.num_rows
-                                          : offidx.page_locations[pg_idx + 1].first_row_index);
+                auto const pg_end_row =
+                  chunk_start_row + (pg_idx == (num_pages - 1)
+                                       ? rg.num_rows
+                                       : offidx.page_locations[pg_idx + 1].first_row_index);
                 if (range_matches(pg_start_row, pg_end_row)) {
-                  //printf("adding col %ld %ld %ld\n", col_idx, pg_start_row, pg_end_row);
-                  chunk_info.pages.push_back(page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
+                  // printf("adding col %ld %ld %ld\n", col_idx, pg_start_row, pg_end_row);
+                  chunk_info.pages.push_back(
+                    page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
                 }
               }
             }
@@ -1184,7 +1190,8 @@ std::future<void> reader::impl::read_column_chunks(
         const bool is_next_compressed =
           (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
         const bool is_next_contiguous = chunks[next_chunk].is_contiguous;
-        if (!is_next_contiguous || next_offset != io_offset + io_size || is_next_compressed != is_compressed) {
+        if (!is_next_contiguous || next_offset != io_offset + io_size ||
+            is_next_compressed != is_compressed) {
           // Can't merge if not contiguous or mixing compressed and uncompressed
           // Not coalescing uncompressed with compressed chunks is so that compressed buffers can be
           // freed earlier (immediately after decompression stage) to limit peak memory requirements
@@ -1822,14 +1829,15 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     if (uses_custom_row_bounds) {
       for (auto const& rg : selected_row_groups) {
         if (rg.has_page_index()) {
-          thrust::for_each(rg.chunks.begin(), rg.chunks.end(),
-            [&](aggregate_reader_metadata::column_info const& chunk) {
-              if (not chunk.is_contiguous()) { num_extra_pages++; }
-            });
+          thrust::for_each(rg.chunks.begin(),
+                           rg.chunks.end(),
+                           [&](aggregate_reader_metadata::column_info const& chunk) {
+                             if (not chunk.is_contiguous()) { num_extra_pages++; }
+                           });
         }
       }
     }
-    //printf("read:num_extra_pages %d\n", num_extra_pages);
+    // printf("read:num_extra_pages %d\n", num_extra_pages);
 
     // Association between each column chunk and its source
     std::vector<size_type> chunk_source_map(num_chunks);
@@ -1859,7 +1867,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       // generate ColumnChunkDesc objects for everything to be decoded (all input columns)
       for (size_t i = 0; i < num_input_columns; ++i) {
         size_t first_page_row = 0;
-        auto col = _input_columns[i];
+        auto col              = _input_columns[i];
         // look up metadata
         auto& col_meta = _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
         auto& schema   = _metadata->get_schema(col.schema_idx);
@@ -1886,38 +1894,39 @@ table_with_metadata reader::impl::read(size_type skip_rows,
             colidx++;
           }
 
-          //printf("hello i %ld schema %d colidx %d\n", i, col.schema_idx, colidx);
+          // printf("hello i %ld schema %d colidx %d\n", i, col.schema_idx, colidx);
 
           auto const& col_info = rg.chunks[colidx];
-          //printf("  npages %ld\n", col_info.pages.size());
+          // printf("  npages %ld\n", col_info.pages.size());
           if (col_info.pages.size() == 0) {
-            dict_size = 0;
+            dict_size       = 0;
             compressed_size = 0;
           } else {
             auto size_input = thrust::make_transform_iterator(
-              col_info.pages.begin(), [] (aggregate_reader_metadata::page_info const& page) {
+              col_info.pages.begin(), [](aggregate_reader_metadata::page_info const& page) {
                 return page.location.compressed_page_size;
               });
             compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
-            //printf("  is contig %d %ld\n", col_info.is_contiguous(), col_info.dictionary_offset);
+            // printf("  is contig %d %ld\n", col_info.is_contiguous(), col_info.dictionary_offset);
             if (col_info.dictionary_offset && not col_info.is_contiguous()) {
               column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
-              dict_size = col_info.dictionary_size;
-              is_contiguous = false;
-              column_chunk_offsets[chunk_idx] = col_info.pages[0].location.offset;
+              dict_size                         = col_info.dictionary_size;
+              is_contiguous                     = false;
+              column_chunk_offsets[chunk_idx]   = col_info.pages[0].location.offset;
             } else {
               dict_size = 0;
               compressed_size += col_info.dictionary_size;
-              column_chunk_offsets[chunk_idx] = col_info.dictionary_offset ? 
-                col_info.dictionary_offset : col_info.pages[0].location.offset;
+              column_chunk_offsets[chunk_idx] = col_info.dictionary_offset
+                                                  ? col_info.dictionary_offset
+                                                  : col_info.pages[0].location.offset;
             }
 
             // override row_group_start and row_group_rows
             first_page_row = col_info.pages[0].location.first_row_index;
           }
-          //printf("compsz %d dictsz %d\n", compressed_size, dict_size);
+          // printf("compsz %d dictsz %d\n", compressed_size, dict_size);
         } else {
-          dict_size = 0;
+          dict_size       = 0;
           compressed_size = col_meta.total_compressed_size;
           column_chunk_offsets[chunks.size()] =
             col_meta.dictionary_page_offset
@@ -1960,9 +1969,14 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         chunk_idx++;
       }
       // Read compressed chunk data to device memory
-      //printf("read rowgroups %ld %ld %ld\n", io_chunk_idx, start_chunk_idx, chunks.size());
-      read_rowgroup_tasks.push_back(read_column_chunks(
-        page_data, chunks, io_chunk_idx, chunks.size(), column_chunk_offsets, chunk_source_map, start_chunk_idx));
+      // printf("read rowgroups %ld %ld %ld\n", io_chunk_idx, start_chunk_idx, chunks.size());
+      read_rowgroup_tasks.push_back(read_column_chunks(page_data,
+                                                       chunks,
+                                                       io_chunk_idx,
+                                                       chunks.size(),
+                                                       column_chunk_offsets,
+                                                       chunk_source_map,
+                                                       start_chunk_idx));
 
       remaining_rows -= row_group.num_rows;
     }

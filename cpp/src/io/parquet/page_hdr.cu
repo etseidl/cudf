@@ -363,8 +363,8 @@ __global__ void __launch_bounds__(128)
 
       // special case for split chunks
       if (bs->ck.dictionary_data) {
-        bs->base = bs->cur      = bs->ck.dictionary_data;
-        bs->end                 = bs->base + bs->ck.dictionary_size;
+        bs->base = bs->cur = bs->ck.dictionary_data;
+        bs->end            = bs->base + bs->ck.dictionary_size;
         if (parse_page_header(bs)) {
           if (bs->page_type != PageType::DICTIONARY_PAGE) {
             CUDF_UNREACHABLE("Expected dictionary page");
@@ -386,10 +386,10 @@ __global__ void __launch_bounds__(128)
       bs->page.chunk_row = bs->ck.first_page_row;
       bs->page.num_rows  = 0;
     }
-    num_values     = bs->ck.num_values;
-    page_info      = bs->ck.page_info;
-    max_num_pages  = (page_info) ? bs->ck.max_num_pages : 0;
-    values_found   = 0;
+    num_values    = bs->ck.num_values;
+    page_info     = bs->ck.page_info;
+    max_num_pages = (page_info) ? bs->ck.max_num_pages : 0;
+    values_found  = 0;
     __syncwarp();
     while (values_found < num_values && bs->cur < bs->end) {
       int index_out = -1;
@@ -409,7 +409,7 @@ __global__ void __launch_bounds__(128)
               // definition levels
               bs->page.num_rows = bs->page.num_input_values;
               // zero out V2 info
-              bs->page.num_nulls = 0;
+              bs->page.num_nulls     = 0;
               bs->page.def_lvl_bytes = 0;
               bs->page.rep_lvl_bytes = 0;
               values_found += bs->page.num_input_values;
@@ -417,7 +417,7 @@ __global__ void __launch_bounds__(128)
             case PageType::DATA_PAGE_V2:
               index_out = num_dict_pages + data_page_count;
               data_page_count++;
-              bs->page.flags = 0;
+              bs->page.flags                     = 0;
               bs->page.definition_level_encoding = Encoding::RLE;
               bs->page.repetition_level_encoding = Encoding::RLE;
               values_found += bs->page.num_input_values;
@@ -437,9 +437,7 @@ __global__ void __launch_bounds__(128)
       }
       index_out = shuffle(index_out);
       if (lane_id == 0) {
-        if (index_out >= 0 && index_out < max_num_pages) {
-          page_info[index_out] = bs->page;
-        }
+        if (index_out >= 0 && index_out < max_num_pages) { page_info[index_out] = bs->page; }
         // this will only be correct for flat schemas or V2 headers.
         // need num_rows from page index if available
         bs->page.chunk_row += bs->page.num_rows;
