@@ -657,10 +657,10 @@ class aggregate_reader_metadata {
     std::vector<row_group_info> selection;
     size_type count = 0;
     for (size_t src_idx = 0; src_idx < per_file_metadata.size(); ++src_idx) {
-      auto const& fmd   = per_file_metadata[src_idx];
+      auto const& fmd = per_file_metadata[src_idx];
 
       for (size_t rg_idx = 0; rg_idx < fmd.row_groups.size(); ++rg_idx) {
-        auto const& rg         = fmd.row_groups[rg_idx];
+        auto const& rg = fmd.row_groups[rg_idx];
 
         auto const chunk_start_row = count;
         count += rg.num_rows;
@@ -684,10 +684,23 @@ class aggregate_reader_metadata {
               auto const& colidx = fmd.column_indexes[idx_idx];
               auto num_pages     = offidx.page_locations.size();
 
-              chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
-              chunk_info.dictionary_size = chunk_info.dictionary_offset ?
-                chunk.meta_data.data_page_offset - chunk_info.dictionary_offset
-                : 0;
+              // bug in parquet-mr does not write dictionary offsets, so check to
+              // see if data_page_offset differs from first entry in offsets index
+              if (chunk.meta_data.dictionary_page_offset) {
+                chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
+                chunk_info.dictionary_size = chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
+              } else {
+                if (num_pages && chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
+                  chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
+                  chunk_info.dictionary_size = offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
+                  // fix metadata too just in case. not working through const
+                  //chunk.meta_data.dictionary_page_offset = chunk.meta_data.data_page_offset;
+                  //chunk.meta_data.data_page_offset = offidx.page_locations[0].offset;
+                } else {
+                  chunk_info.dictionary_offset = 0;
+                  chunk_info.dictionary_size = 0;
+                }
+              }
 
               auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start, size_type pg_end) {
                 return row_start < pg_end && row_end > pg_start;
@@ -1816,7 +1829,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         }
       }
     }
-    printf("read:num_extra_pages %d\n", num_extra_pages);
+    //printf("read:num_extra_pages %d\n", num_extra_pages);
 
     // Association between each column chunk and its source
     std::vector<size_type> chunk_source_map(num_chunks);
@@ -1873,10 +1886,10 @@ table_with_metadata reader::impl::read(size_type skip_rows,
             colidx++;
           }
 
-          printf("hello i %ld schema %d colidx %d\n", i, col.schema_idx, colidx);
+          //printf("hello i %ld schema %d colidx %d\n", i, col.schema_idx, colidx);
 
           auto const& col_info = rg.chunks[colidx];
-          printf("  npages %ld\n", col_info.pages.size());
+          //printf("  npages %ld\n", col_info.pages.size());
           if (col_info.pages.size() == 0) {
             dict_size = 0;
             compressed_size = 0;
@@ -1886,11 +1899,12 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                 return page.location.compressed_page_size;
               });
             compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
-            printf("  is contig %d %ld\n", col_info.is_contiguous(), col_info.dictionary_offset);
+            //printf("  is contig %d %ld\n", col_info.is_contiguous(), col_info.dictionary_offset);
             if (col_info.dictionary_offset && not col_info.is_contiguous()) {
               column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
               dict_size = col_info.dictionary_size;
               is_contiguous = false;
+              column_chunk_offsets[chunk_idx] = col_info.pages[0].location.offset;
             } else {
               dict_size = 0;
               compressed_size += col_info.dictionary_size;
@@ -1901,7 +1915,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
             // override row_group_start and row_group_rows
             first_page_row = col_info.pages[0].location.first_row_index;
           }
-          printf("compsz %d dictsz %d\n", compressed_size, dict_size);
+          //printf("compsz %d dictsz %d\n", compressed_size, dict_size);
         } else {
           dict_size = 0;
           compressed_size = col_meta.total_compressed_size;
@@ -1968,9 +1982,13 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       if (total_decompressed_size > 0) {
         decomp_page_data = decompress_page_data(chunks, pages);
         // Free compressed data
-        for (size_t c = 0; c < chunks.size(); c++) {
-          // FIXME(ets): need to check for discontiguous page dictionaries
-          if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) { page_data[c].reset(); }
+        for (size_t c = 0, p = 0; c < chunks.size(); c++, p++) {
+          // need to check for discontiguous page dictionaries
+          if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) {
+            page_data[c].reset();
+            // if chunk is not contiguous then get rid of extra page_data entry
+            if (not chunks[c].is_contiguous) { page_data[++p].reset(); }
+          }
         }
       }
 
