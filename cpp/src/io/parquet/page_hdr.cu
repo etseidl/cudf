@@ -398,8 +398,6 @@ __global__ void __launch_bounds__(128)
         bs->page.num_rows = 0;
         if (parse_page_header(bs) && bs->page.compressed_page_size >= 0) {
           switch (bs->page_type) {
-            // FIXME pagev2 handling is all wrong. skip the fallthrough and do
-            // each type of page header separately
             case PageType::DATA_PAGE:
               index_out = num_dict_pages + data_page_count;
               data_page_count++;
