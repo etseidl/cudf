@@ -406,15 +406,6 @@ class aggregate_reader_metadata {
   }
 
   /**
-   * @brief Tests if page-level statistics are available
-   */
-  [[nodiscard]] bool has_page_stats() const {
-    return std::all_of(per_file_metadata.begin(), per_file_metadata.end(), [](metadata const& meta) {
-      return not (meta.offset_indexes.empty() && meta.column_indexes.empty()); 
-    });
-  }
-
-  /**
    * @brief Sums up the number of rows of each source
    */
   [[nodiscard]] size_type calc_num_rows() const
@@ -459,6 +450,15 @@ class aggregate_reader_metadata {
       CUDF_EXPECTS(per_file_metadata[0].schema == pfm.schema,
                    "All sources must have the same schemas");
     }
+  }
+
+  /**
+   * @brief Tests if page-level statistics are available
+   */
+  [[nodiscard]] bool has_page_stats() const {
+    return std::all_of(per_file_metadata.begin(), per_file_metadata.end(), [](metadata const& meta) {
+      return not (meta.offset_indexes.empty() && meta.column_indexes.empty());
+    });
   }
 
   [[nodiscard]] auto const& get_row_group(size_type row_group_index, size_type src_idx) const
@@ -1245,16 +1245,29 @@ std::future<void> reader::impl::read_column_chunks(
 /**
  * @copydoc cudf::io::detail::parquet::count_page_headers
  */
-size_t reader::impl::count_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& chunks)
+size_t reader::impl::count_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
+                                        std::vector<row_group_info> const& row_groups)
 {
   size_t total_pages = 0;
 
-  chunks.host_to_device(_stream);
-  gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
-  chunks.device_to_host(_stream, true);
+  // this pass just calculates num_data_pages and num_dict_pages.  can
+  // figure this out from metadata if we have page indexes
+  if (_metadata->has_page_stats()) {
+    for (auto& chunk : chunks) {
+      auto const& col_info = row_groups[chunk.row_group_idx].columns[chunk.pgidx_col_idx];
+      chunks[c].num_dict_pages = col_info.dictionary_offset > 0 ? 1 : 0;
+      chunks[c].num_data_pages = col_info.pages.size();
+      total_pages += chunks[c].num_data_pages + chunks[c].num_dict_pages;
+    }
+  }
+  else {
+    chunks.host_to_device(_stream);
+    gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
+    chunks.device_to_host(_stream, true);
 
-  for (size_t c = 0; c < chunks.size(); c++) {
-    total_pages += chunks[c].num_data_pages + chunks[c].num_dict_pages;
+    for (size_t c = 0; c < chunks.size(); c++) {
+      total_pages += chunks[c].num_data_pages + chunks[c].num_dict_pages;
+    }
   }
 
   return total_pages;
@@ -1278,10 +1291,23 @@ void reader::impl::decode_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& 
   gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
   pages.device_to_host(_stream, true);
 
-  // TODO(ets): fill in page_info num_null using page index if available
-  // not sure if it will ever be used though, so decide later
-  // can also fix page chunk_row as well, although it will be correct for
-  // flat and later corrected for nested, so ???
+  // fill in page_info num_null using page index if available
+  // TODO(ets): not sure if it will ever be used though, so maybe remove
+  // also fix page chunk_row and num_rows, although these will be correct for
+  // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
+  if (_metadata->has_page_stats()) {
+    for (auto const& chunk : chunks) {
+      auto const& col_info = row_groups[chunk.row_group_idx].columns[chunk.pgidx_col_idx];
+      size_t start_row = chunk.first_page_row;
+      auto page = &chunk.page_info[chunk.num_dict_pages];
+      for (size_t p = 0; p < col_info.pages.size(); p++, page++) {
+        page->num_rows = col_info.pages[p].num_rows;
+        page->chunk_row = start_row;
+        page->num_nulls = col_info.pages[p].num_null;
+        start_row += page->num_rows;
+      }
+    }
+  }
 }
 
 /**
@@ -1839,6 +1865,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     if (uses_custom_row_bounds) {
       for (auto const& rg : selected_row_groups) {
         if (rg.has_page_index()) {
+          // TODO(ets): use accumulate?
           thrust::for_each(rg.chunks.begin(),
                            rg.chunks.end(),
                            [&](aggregate_reader_metadata::column_info const& chunk) {
@@ -1866,7 +1893,8 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     auto remaining_rows            = num_rows;
     size_t chunk_idx               = 0;
     std::vector<std::future<void>> read_rowgroup_tasks;
-    for (const auto& rg : selected_row_groups) {
+    for (size_t rg_idx = 0; rg_idx < selected_row_groups.size(); rg_idx++) {
+      const auto& rg              = selected_row_groups[rg_idx];
       const auto& row_group       = _metadata->get_row_group(rg.index, rg.source_index);
       auto const row_group_start  = rg.start_row;
       auto const row_group_source = rg.source_index;
@@ -1896,16 +1924,15 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         size_type dict_size;
 
         bool is_contiguous = true;
+
+        // translate schema_idx into something we can use for the page indexes
+        size_type colidx = 0;
+        for (auto const& colchunk : _metadata->get_row_group(rg.index, rg.source_index).columns) {
+          if (colchunk.schema_idx == col.schema_idx) { break; }
+          colidx++;
+        }
+
         if (uses_custom_row_bounds && rg.has_page_index()) {
-          // translate schema_idx into something we can use
-          int colidx = 0;
-          for (auto const& colchunk : _metadata->get_row_group(rg.index, rg.source_index).columns) {
-            if (colchunk.schema_idx == col.schema_idx) { break; }
-            colidx++;
-          }
-
-          // printf("hello i %ld schema %d colidx %d\n", i, col.schema_idx, colidx);
-
           auto const& col_info = rg.chunks[colidx];
           // printf("  npages %ld\n", col_info.pages.size());
           if (col_info.pages.size() == 0) {
@@ -1966,7 +1993,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                               schema.decimal_scale,
                                               clock_rate,
                                               i,
-                                              col.schema_idx));
+                                              col.schema_idx,
+                                              rg_idx,
+                                              colidx);
 
         // Map each column chunk to its column index and its source index
         chunk_source_map[chunks.size() - 1] = row_group_source;
@@ -1996,7 +2025,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     assert(remaining_rows <= 0);
 
     // Process dataset chunk pages into output columns
-    const auto total_pages = count_page_headers(chunks);
+    const auto total_pages = count_page_headers(chunks, selected_row_groups);
     if (total_pages > 0) {
       hostdevice_vector<gpu::PageInfo> pages(total_pages, total_pages, _stream);
       rmm::device_buffer decomp_page_data;

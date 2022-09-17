@@ -186,7 +186,9 @@ struct ColumnChunkDesc {
                            int8_t decimal_scale_,
                            int32_t ts_clock_rate_,
                            int32_t src_col_index_,
-                           int32_t src_col_schema_)
+                           int32_t src_col_schema_,
+                           size_type row_group_idx_,
+                           size_type pgidx_col_idx_)
     : dictionary_size(dictionary_size_),
       dictionary_data(dictionary_data_),
       compressed_size(compressed_size_),
@@ -213,7 +215,9 @@ struct ColumnChunkDesc {
       decimal_scale(decimal_scale_),
       ts_clock_rate(ts_clock_rate_),
       src_col_index(src_col_index_),
-      src_col_schema(src_col_schema_)
+      src_col_schema(src_col_schema_),
+      row_group_idx(row_group_idx_),
+      pgidx_col_idx(pgidx_col_idx_)
   {
   }
 
@@ -246,8 +250,10 @@ struct ColumnChunkDesc {
   int8_t decimal_scale;                       // decimal scale pow(10, -decimal_scale)
   int32_t ts_clock_rate;  // output timestamp clock frequency (0=default, 1000=ms, 1000000000=ns)
 
-  int32_t src_col_index;   // my input column index
-  int32_t src_col_schema;  // my schema index in the file
+  int32_t src_col_index;    // my input column index
+  int32_t src_col_schema;   // my schema index in the file
+  size_type row_group_idx;  // index of the row_group_info for this chunk
+  size_type pgidx_col_idx;  // index of this column in page stats, -1 if no stats
 };
 
 /**
