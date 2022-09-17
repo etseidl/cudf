@@ -1746,6 +1746,7 @@ void PreprocessColumnData(hostdevice_vector<PageInfo>& pages,
                           size_t num_rows,
                           size_t min_row,
                           bool uses_custom_row_bounds,
+                          bool has_page_stats,
                           rmm::cuda_stream_view stream,
                           rmm::mr::device_memory_resource* mr)
 {
@@ -1767,15 +1768,17 @@ void PreprocessColumnData(hostdevice_vector<PageInfo>& pages,
 
   // computes:
   // PageInfo::chunk_row for all pages
-  auto key_input = thrust::make_transform_iterator(
-    pages.device_ptr(), [] __device__(PageInfo const& page) { return page.chunk_idx; });
-  auto page_input = thrust::make_transform_iterator(
-    pages.device_ptr(), [] __device__(PageInfo const& page) { return page.num_rows; });
-  thrust::exclusive_scan_by_key(rmm::exec_policy(stream),
-                                key_input,
-                                key_input + pages.size(),
-                                page_input,
-                                chunk_row_output_iter{pages.device_ptr()});
+  if (not has_page_stats) {
+    auto key_input = thrust::make_transform_iterator(
+      pages.device_ptr(), [] __device__(PageInfo const& page) { return page.chunk_idx; });
+    auto page_input = thrust::make_transform_iterator(
+      pages.device_ptr(), [] __device__(PageInfo const& page) { return page.num_rows; });
+    thrust::exclusive_scan_by_key(rmm::exec_policy(stream),
+                                  key_input,
+                                  key_input + pages.size(),
+                                  page_input,
+                                  chunk_row_output_iter{pages.device_ptr()});
+  }
 
   // computes:
   // PageNestingInfo::size for each level of nesting, for each page, taking row bounds into account.

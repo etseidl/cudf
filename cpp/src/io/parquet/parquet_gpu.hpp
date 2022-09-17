@@ -440,6 +440,7 @@ void BuildStringDictionaryIndex(ColumnChunkDesc* chunks,
  * @param num_rows Maximum number of rows to read
  * @param min_rows crop all rows below min_row
  * @param uses_custom_row_bounds Whether or not num_rows and min_rows represents user-specific
+ * @param has_page_stats True if page indexes are available
  * bounds
  * @param stream Cuda stream
  */
@@ -450,6 +451,7 @@ void PreprocessColumnData(hostdevice_vector<PageInfo>& pages,
                           size_t num_rows,
                           size_t min_row,
                           bool uses_custom_row_bounds,
+                          bool has_page_stats,
                           rmm::cuda_stream_view stream,
                           rmm::mr::device_memory_resource* mr);
 

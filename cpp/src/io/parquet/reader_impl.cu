@@ -406,6 +406,15 @@ class aggregate_reader_metadata {
   }
 
   /**
+   * @brief Tests if page-level statistics are available
+   */
+  [[nodiscard]] bool has_page_stats() const {
+    return std::all_of(per_file_metadata.begin(), per_file_metadata.end(), [](metadata const& meta) {
+      return not (meta.offset_indexes.empty() && meta.column_indexes.empty()); 
+    });
+  }
+
+  /**
    * @brief Sums up the number of rows of each source
    */
   [[nodiscard]] size_type calc_num_rows() const
@@ -1576,6 +1585,7 @@ void reader::impl::preprocess_columns(hostdevice_vector<gpu::ColumnChunkDesc>& c
                               total_rows,
                               min_row,
                               uses_custom_row_bounds,
+                              _metadata->has_page_stats(),
                               _stream,
                               _mr);
     _stream.synchronize();
