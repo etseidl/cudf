@@ -1242,23 +1242,33 @@ std::future<void> reader::impl::read_column_chunks(
   return std::async(std::launch::deferred, sync_fn, std::move(read_tasks));
 }
 
+namespace {
+size_t count_page_headers_with_pgidx(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
+                                     std::vector<aggregate_reader_metadata::row_group_info> row_groups)
+{
+  size_t total_pages = 0;
+  for (auto& chunk : chunks) {
+    auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
+    chunk.num_dict_pages = col_info.dictionary_offset > 0 ? 1 : 0;
+    chunk.num_data_pages = col_info.pages.size();
+    total_pages += chunk.num_data_pages + chunk.num_dict_pages;
+  }
+  return total_pages;
+}
+
+} // namespace
+
 /**
  * @copydoc cudf::io::detail::parquet::count_page_headers
  */
-size_t reader::impl::count_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
-                                        std::vector<row_group_info> const& row_groups)
+size_t reader::impl::count_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& chunks)
 {
   size_t total_pages = 0;
 
   // this pass just calculates num_data_pages and num_dict_pages.  can
   // figure this out from metadata if we have page indexes
   if (_metadata->has_page_stats()) {
-    for (auto& chunk : chunks) {
-      auto const& col_info = row_groups[chunk.row_group_idx].columns[chunk.pgidx_col_idx];
-      chunks[c].num_dict_pages = col_info.dictionary_offset > 0 ? 1 : 0;
-      chunks[c].num_data_pages = col_info.pages.size();
-      total_pages += chunks[c].num_data_pages + chunks[c].num_dict_pages;
-    }
+    total_pages = 0; // argh...need to move elsewhere and call other from ::read()
   }
   else {
     chunks.host_to_device(_stream);
@@ -1295,6 +1305,7 @@ void reader::impl::decode_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& 
   // TODO(ets): not sure if it will ever be used though, so maybe remove
   // also fix page chunk_row and num_rows, although these will be correct for
   // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
+#if 0 // call from ::read()
   if (_metadata->has_page_stats()) {
     for (auto const& chunk : chunks) {
       auto const& col_info = row_groups[chunk.row_group_idx].columns[chunk.pgidx_col_idx];
@@ -1308,6 +1319,7 @@ void reader::impl::decode_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& 
       }
     }
   }
+#endif
 }
 
 /**
@@ -1995,7 +2007,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                               i,
                                               col.schema_idx,
                                               rg_idx,
-                                              colidx);
+                                              colidx));
 
         // Map each column chunk to its column index and its source index
         chunk_source_map[chunks.size() - 1] = row_group_source;
@@ -2025,7 +2037,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     assert(remaining_rows <= 0);
 
     // Process dataset chunk pages into output columns
-    const auto total_pages = count_page_headers(chunks, selected_row_groups);
+    const auto total_pages = count_page_headers(chunks);
     if (total_pages > 0) {
       hostdevice_vector<gpu::PageInfo> pages(total_pages, total_pages, _stream);
       rmm::device_buffer decomp_page_data;
