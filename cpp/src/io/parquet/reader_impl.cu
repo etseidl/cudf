@@ -1244,7 +1244,7 @@ std::future<void> reader::impl::read_column_chunks(
 
 namespace {
 size_t count_page_headers_with_pgidx(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
-                                     std::vector<aggregate_reader_metadata::row_group_info> row_groups)
+                                     std::vector<aggregate_reader_metadata::row_group_info> const& row_groups)
 {
   size_t total_pages = 0;
   for (auto& chunk : chunks) {
@@ -1256,6 +1256,27 @@ size_t count_page_headers_with_pgidx(hostdevice_vector<gpu::ColumnChunkDesc>& ch
   return total_pages;
 }
 
+void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
+                       hostdevice_vector<gpu::PageInfo>& pages,
+                       std::vector<aggregate_reader_metadata::row_group_info> const& row_groups)
+{
+  // fill in page_info num_null using page index if available
+  // TODO(ets): not sure if it will ever be used though, so maybe remove
+  // also fix page chunk_row and num_rows, although these will be correct for
+  // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
+  for (auto const& chunk : chunks) {
+    auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
+    size_t start_row = chunk.first_page_row;
+    auto page = &chunk.page_info[chunk.num_dict_pages];
+    for (size_t p = 0; p < col_info.pages.size(); p++, page++) {
+      page->num_rows = col_info.pages[p].num_rows;
+      page->chunk_row = start_row;
+      page->num_nulls = col_info.pages[p].num_nulls;
+      start_row += page->num_rows;
+    }
+  }
+}
+
 } // namespace
 
 /**
@@ -1265,8 +1286,6 @@ size_t reader::impl::count_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>&
 {
   size_t total_pages = 0;
 
-  // this pass just calculates num_data_pages and num_dict_pages.  can
-  // figure this out from metadata if we have page indexes
   if (_metadata->has_page_stats()) {
     total_pages = 0; // argh...need to move elsewhere and call other from ::read()
   }
@@ -1300,26 +1319,6 @@ void reader::impl::decode_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>& 
   chunks.host_to_device(_stream);
   gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
   pages.device_to_host(_stream, true);
-
-  // fill in page_info num_null using page index if available
-  // TODO(ets): not sure if it will ever be used though, so maybe remove
-  // also fix page chunk_row and num_rows, although these will be correct for
-  // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
-#if 0 // call from ::read()
-  if (_metadata->has_page_stats()) {
-    for (auto const& chunk : chunks) {
-      auto const& col_info = row_groups[chunk.row_group_idx].columns[chunk.pgidx_col_idx];
-      size_t start_row = chunk.first_page_row;
-      auto page = &chunk.page_info[chunk.num_dict_pages];
-      for (size_t p = 0; p < col_info.pages.size(); p++, page++) {
-        page->num_rows = col_info.pages[p].num_rows;
-        page->chunk_row = start_row;
-        page->num_nulls = col_info.pages[p].num_null;
-        start_row += page->num_rows;
-      }
-    }
-  }
-#endif
 }
 
 /**
@@ -2037,13 +2036,20 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     assert(remaining_rows <= 0);
 
     // Process dataset chunk pages into output columns
-    const auto total_pages = count_page_headers(chunks);
+    // this pass just calculates num_data_pages and num_dict_pages.  can
+    // figure this out from metadata if we have page indexes
+    const auto total_pages = _metadata->has_page_stats() ?
+      count_page_headers_with_pgidx(chunks, selected_row_groups) :
+      count_page_headers(chunks);
     if (total_pages > 0) {
       hostdevice_vector<gpu::PageInfo> pages(total_pages, total_pages, _stream);
       rmm::device_buffer decomp_page_data;
 
       // decoding of column/page information
       decode_page_headers(chunks, pages);
+      if (_metadata->has_page_stats()) {
+        fill_in_page_info(chunks, pages, selected_row_groups);
+      }
       if (total_decompressed_size > 0) {
         decomp_page_data = decompress_page_data(chunks, pages);
         // Free compressed data
