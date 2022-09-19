@@ -624,6 +624,69 @@ class aggregate_reader_metadata {
     bool has_page_index() const { return chunks.size() > 0; }
   };
 
+  void column_info_for_row_group(row_group_info& rgi,
+                                 size_type chunk_start_row,
+                                 size_type row_start,
+                                 size_type row_count) const
+  {
+    auto const& fmd = per_file_metadata[rgi.source_index];
+    auto const& rg = fmd.row_groups[rgi.index];
+    rgi.chunks.resize(rg.columns.size());
+
+    // printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
+
+    // now fill in column info for pages that intersect the range
+    // [row_start, row_start + row_count)
+    for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
+      auto const& chunk  = rg.columns[col_idx];
+      auto& chunk_info   = rgi.chunks[col_idx];
+      auto const idx_idx = rgi.index * rg.columns.size() + col_idx;
+      auto const& offidx = fmd.offset_indexes[idx_idx];
+      auto const& colidx = fmd.column_indexes[idx_idx];
+      auto num_pages     = offidx.page_locations.size();
+
+      // bug in parquet-mr does not write dictionary offsets, so check to
+      // see if data_page_offset differs from first entry in offsets index
+      if (chunk.meta_data.dictionary_page_offset) {
+        chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
+        chunk_info.dictionary_size =
+          chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
+      } else {
+        if (num_pages &&
+            chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
+          chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
+          chunk_info.dictionary_size =
+            offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
+          // fix metadata too just in case. not working through const
+          // chunk.meta_data.dictionary_page_offset = chunk.meta_data.data_page_offset;
+          // chunk.meta_data.data_page_offset = offidx.page_locations[0].offset;
+        } else {
+          chunk_info.dictionary_offset = 0;
+          chunk_info.dictionary_size   = 0;
+        }
+      }
+
+      auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start,
+                                                                        size_type pg_end) {
+        return row_start < pg_end && row_end > pg_start;
+      };
+
+      for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
+        auto const& page_loc    = offidx.page_locations[pg_idx];
+        auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
+        auto const pg_end_row =
+          chunk_start_row + (pg_idx == (num_pages - 1)
+                               ? rg.num_rows
+                               : offidx.page_locations[pg_idx + 1].first_row_index);
+        if (range_matches(pg_start_row, pg_end_row)) {
+          // printf("adding col %ld %ld %ld\n", col_idx, pg_start_row, pg_end_row);
+          chunk_info.pages.push_back(
+            page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
+        }
+      }
+    }
+  }
+
   /**
    * @brief Filters and reduces down to a selection of row groups
    *
@@ -644,12 +707,20 @@ class aggregate_reader_metadata {
 
       row_count = 0;
       for (size_t src_idx = 0; src_idx < row_groups.size(); ++src_idx) {
+        auto const& fmd = per_file_metadata[src_idx];
         for (auto const& rowgroup_idx : row_groups[src_idx]) {
           CUDF_EXPECTS(
             rowgroup_idx >= 0 &&
-              rowgroup_idx < static_cast<size_type>(per_file_metadata[src_idx].row_groups.size()),
+              rowgroup_idx < static_cast<size_type>(fmd.row_groups.size()),
             "Invalid rowgroup index");
-          selection.emplace_back(rowgroup_idx, row_count, src_idx);
+          row_group_info rgi(rowgroup_idx, row_count, src_idx);
+          // if page-level indexes are present, then collect extra chunk and page info.
+          if (fmd.offset_indexes.size() > 0 && fmd.column_indexes.size() > 0) {
+            // range counting is invalid when picking row groups, so just set bounds
+            // to [0, infinity)
+            column_info_for_row_group(rgi, 0, 0, std::numeric_limits<size_type>::max());
+          }
+          selection.emplace_back(rgi);
           row_count += get_row_group(rowgroup_idx, src_idx).num_rows;
         }
       }
@@ -681,60 +752,7 @@ class aggregate_reader_metadata {
           // if page-level indexes are present, then collect extra chunk and page
           // info. if using custom bounds, then figure out which pages to read
           if (fmd.offset_indexes.size() > 0 && fmd.column_indexes.size() > 0) {
-            rgi.chunks.resize(rg.columns.size());
-
-            // printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
-
-            // now fill in column info for pages that intersect the range
-            // [row_start, row_start + row_count)
-            for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
-              auto const& chunk  = rg.columns[col_idx];
-              auto& chunk_info   = rgi.chunks[col_idx];
-              auto const idx_idx = rg_idx * rg.columns.size() + col_idx;
-              auto const& offidx = fmd.offset_indexes[idx_idx];
-              auto const& colidx = fmd.column_indexes[idx_idx];
-              auto num_pages     = offidx.page_locations.size();
-
-              // bug in parquet-mr does not write dictionary offsets, so check to
-              // see if data_page_offset differs from first entry in offsets index
-              if (chunk.meta_data.dictionary_page_offset) {
-                chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
-                chunk_info.dictionary_size =
-                  chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
-              } else {
-                if (num_pages &&
-                    chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
-                  chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
-                  chunk_info.dictionary_size =
-                    offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
-                  // fix metadata too just in case. not working through const
-                  // chunk.meta_data.dictionary_page_offset = chunk.meta_data.data_page_offset;
-                  // chunk.meta_data.data_page_offset = offidx.page_locations[0].offset;
-                } else {
-                  chunk_info.dictionary_offset = 0;
-                  chunk_info.dictionary_size   = 0;
-                }
-              }
-
-              auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start,
-                                                                                size_type pg_end) {
-                return row_start < pg_end && row_end > pg_start;
-              };
-
-              for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
-                auto const& page_loc    = offidx.page_locations[pg_idx];
-                auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
-                auto const pg_end_row =
-                  chunk_start_row + (pg_idx == (num_pages - 1)
-                                       ? rg.num_rows
-                                       : offidx.page_locations[pg_idx + 1].first_row_index);
-                if (range_matches(pg_start_row, pg_end_row)) {
-                  // printf("adding col %ld %ld %ld\n", col_idx, pg_start_row, pg_end_row);
-                  chunk_info.pages.push_back(
-                    page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
-                }
-              }
-            }
+            column_info_for_row_group(rgi, chunk_start_row, row_start, row_count);
           }
           selection.emplace_back(rgi);
         }
@@ -1271,12 +1289,12 @@ void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
     auto const& chunk    = chunks[c];
     auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
     size_t start_row     = chunk.first_page_row;
-    auto page            = &pages[page_count + chunk.num_dict_pages];
-    for (size_t p = 0; p < col_info.pages.size(); p++, page++) {
-      page->num_rows  = col_info.pages[p].num_rows;
-      page->chunk_row = start_row;
-      page->num_nulls = col_info.pages[p].num_nulls;
-      start_row += page->num_rows;
+    page_count += chunk.num_dict_pages;
+    for (size_t p = 0; p < col_info.pages.size(); p++, page_count++) {
+      pages[page_count].num_rows  = col_info.pages[p].num_rows;
+      pages[page_count].chunk_row = start_row;
+      pages[page_count].num_nulls = col_info.pages[p].num_nulls;
+      start_row += pages[page_count].num_rows;
     }
   }
 }
@@ -2046,7 +2064,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
 
       // decoding of column/page information
       decode_page_headers(chunks, pages);
-      if (_metadata->has_page_stats()) {
+      if (has_lists && _metadata->has_page_stats()) {
         fill_in_page_info(chunks, pages, selected_row_groups);
         pages.host_to_device(_stream, true);
       }
