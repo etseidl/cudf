@@ -2689,6 +2689,55 @@ TEST_F(ParquetReaderTest, ListUserBoundsWithNullsLarge)
   }
 }
 
+TEST_F(ParquetReaderTest, MixedUserBoundsWithNullsLarge)
+{
+  constexpr int num_rows = 5 * 1'000'000;
+  auto colp              = make_parquet_list_col<int>(0, num_rows, 5, 8, true);
+  cudf::column_view col0 = *colp;
+
+  std::mt19937 gen(6747);
+  std::bernoulli_distribution bn(0.7f);
+  auto valids =
+    cudf::detail::make_counting_transform_iterator(0, [&](int index) { return bn(gen); });
+  auto values = thrust::make_counting_iterator(0);
+
+  cudf::test::fixed_width_column_wrapper<int> col1(values, values + num_rows, valids);
+
+  // this file will have row groups of 1,000,000 each
+  cudf::table_view tbl({col0, col1});
+  auto filepath = temp_env->get_temp_filepath("MixedUserBoundsWithNullsLarge.parquet");
+  cudf_io::parquet_writer_options out_args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, tbl);
+  cudf_io::write_parquet(out_args);
+
+  // skip_rows / num_rows
+  // clang-format off
+  std::vector<std::pair<int, int>> params{ {-1, -1}, {31, -1}, {32, -1}, {33, -1}, {161470, -1}, {4499997, -1},
+                                           {31, 1}, {32, 1}, {33, 1},
+                                           // deliberately span some row group boundaries
+                                           {999000, 1001}, {999000, 2000}, {2999999, 2},
+                                           {1678567, 3}, {4299676, 31},
+                                           {4001231, 17}, {1900000, 989999}, {4999999, 1} };
+  // clang-format on
+  for (auto p : params) {
+    cudf_io::parquet_reader_options read_args =
+      cudf::io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+    if (p.first >= 0) { read_args.set_skip_rows(p.first); }
+    if (p.second >= 0) { read_args.set_num_rows(p.second); }
+    auto result = cudf_io::read_parquet(read_args);
+
+    p.first  = p.first < 0 ? 0 : p.first;
+    p.second = p.second < 0 ? static_cast<cudf::column_view>(col0).size() - p.first : p.second;
+    std::vector<cudf::size_type> slice_indices{p.first, p.first + p.second};
+
+    auto expected0 = cudf::slice(col0, slice_indices);
+    auto expected1 = cudf::slice(col1, slice_indices);
+
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(0), expected0[0]);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), expected1[0]);
+  }
+}
+
 TEST_F(ParquetReaderTest, ReorderedColumns)
 {
   {
