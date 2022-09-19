@@ -1264,10 +1264,11 @@ void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
   // TODO(ets): not sure if it will ever be used though, so maybe remove
   // also fix page chunk_row and num_rows, although these will be correct for
   // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
-  for (auto const& chunk : chunks) {
+  for (size_t c = 0, page_count = 0; c < chunks.size(); c++) {
+    auto const& chunk = chunks[c];
     auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
     size_t start_row = chunk.first_page_row;
-    auto page = &chunk.page_info[chunk.num_dict_pages];
+    auto page = &pages[page_count + chunk.num_dict_pages];
     for (size_t p = 0; p < col_info.pages.size(); p++, page++) {
       page->num_rows = col_info.pages[p].num_rows;
       page->chunk_row = start_row;
@@ -1286,17 +1287,12 @@ size_t reader::impl::count_page_headers(hostdevice_vector<gpu::ColumnChunkDesc>&
 {
   size_t total_pages = 0;
 
-  if (_metadata->has_page_stats()) {
-    total_pages = 0; // argh...need to move elsewhere and call other from ::read()
-  }
-  else {
-    chunks.host_to_device(_stream);
-    gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
-    chunks.device_to_host(_stream, true);
+  chunks.host_to_device(_stream);
+  gpu::DecodePageHeaders(chunks.device_ptr(), chunks.size(), _stream);
+  chunks.device_to_host(_stream, true);
 
-    for (size_t c = 0; c < chunks.size(); c++) {
-      total_pages += chunks[c].num_data_pages + chunks[c].num_dict_pages;
-    }
+  for (size_t c = 0; c < chunks.size(); c++) {
+    total_pages += chunks[c].num_data_pages + chunks[c].num_dict_pages;
   }
 
   return total_pages;
@@ -2049,6 +2045,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       decode_page_headers(chunks, pages);
       if (_metadata->has_page_stats()) {
         fill_in_page_info(chunks, pages, selected_row_groups);
+        pages.host_to_device(_stream, true);
       }
       if (total_decompressed_size > 0) {
         decomp_page_data = decompress_page_data(chunks, pages);
