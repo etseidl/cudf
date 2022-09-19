@@ -630,7 +630,7 @@ class aggregate_reader_metadata {
                                  size_type row_count) const
   {
     auto const& fmd = per_file_metadata[rgi.source_index];
-    auto const& rg = fmd.row_groups[rgi.index];
+    auto const& rg  = fmd.row_groups[rgi.index];
     rgi.chunks.resize(rg.columns.size());
 
     // printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
@@ -652,8 +652,7 @@ class aggregate_reader_metadata {
         chunk_info.dictionary_size =
           chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
       } else {
-        if (num_pages &&
-            chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
+        if (num_pages && chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
           chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
           chunk_info.dictionary_size =
             offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
@@ -710,8 +709,7 @@ class aggregate_reader_metadata {
         auto const& fmd = per_file_metadata[src_idx];
         for (auto const& rowgroup_idx : row_groups[src_idx]) {
           CUDF_EXPECTS(
-            rowgroup_idx >= 0 &&
-              rowgroup_idx < static_cast<size_type>(fmd.row_groups.size()),
+            rowgroup_idx >= 0 && rowgroup_idx < static_cast<size_type>(fmd.row_groups.size()),
             "Invalid rowgroup index");
           row_group_info rgi(rowgroup_idx, row_count, src_idx);
           // if page-level indexes are present, then collect extra chunk and page info.
