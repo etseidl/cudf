@@ -91,6 +91,8 @@ class reader::impl {
    * @param begin_chunk Index of first column chunk to read
    * @param end_chunk Index after the last column chunk to read
    * @param column_chunk_offsets File offset for all chunks
+   * @param chunk_source_map Source index for each chunk
+   * @param chunk_meta_idx Starting offset into page_data and column_chunk_offsets
    *
    */
   std::future<void> read_column_chunks(std::vector<std::unique_ptr<datasource::buffer>>& page_data,
