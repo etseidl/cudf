@@ -455,10 +455,12 @@ class aggregate_reader_metadata {
   /**
    * @brief Tests if page-level statistics are available
    */
-  [[nodiscard]] bool has_page_stats() const {
-    return std::all_of(per_file_metadata.begin(), per_file_metadata.end(), [](metadata const& meta) {
-      return not (meta.offset_indexes.empty() && meta.column_indexes.empty());
-    });
+  [[nodiscard]] bool has_page_stats() const
+  {
+    return std::all_of(
+      per_file_metadata.begin(), per_file_metadata.end(), [](metadata const& meta) {
+        return not(meta.offset_indexes.empty() && meta.column_indexes.empty());
+      });
   }
 
   [[nodiscard]] auto const& get_row_group(size_type row_group_index, size_type src_idx) const
@@ -1243,8 +1245,9 @@ std::future<void> reader::impl::read_column_chunks(
 }
 
 namespace {
-size_t count_page_headers_with_pgidx(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
-                                     std::vector<aggregate_reader_metadata::row_group_info> const& row_groups)
+size_t count_page_headers_with_pgidx(
+  hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
+  std::vector<aggregate_reader_metadata::row_group_info> const& row_groups)
 {
   size_t total_pages = 0;
   for (auto& chunk : chunks) {
@@ -1265,12 +1268,12 @@ void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
   // also fix page chunk_row and num_rows, although these will be correct for
   // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
   for (size_t c = 0, page_count = 0; c < chunks.size(); c++) {
-    auto const& chunk = chunks[c];
+    auto const& chunk    = chunks[c];
     auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
-    size_t start_row = chunk.first_page_row;
-    auto page = &pages[page_count + chunk.num_dict_pages];
+    size_t start_row     = chunk.first_page_row;
+    auto page            = &pages[page_count + chunk.num_dict_pages];
     for (size_t p = 0; p < col_info.pages.size(); p++, page++) {
-      page->num_rows = col_info.pages[p].num_rows;
+      page->num_rows  = col_info.pages[p].num_rows;
       page->chunk_row = start_row;
       page->num_nulls = col_info.pages[p].num_nulls;
       start_row += page->num_rows;
@@ -1278,7 +1281,7 @@ void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
   }
 }
 
-} // namespace
+}  // namespace
 
 /**
  * @copydoc cudf::io::detail::parquet::count_page_headers
@@ -2034,9 +2037,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     // Process dataset chunk pages into output columns
     // this pass just calculates num_data_pages and num_dict_pages.  can
     // figure this out from metadata if we have page indexes
-    const auto total_pages = _metadata->has_page_stats() ?
-      count_page_headers_with_pgidx(chunks, selected_row_groups) :
-      count_page_headers(chunks);
+    const auto total_pages = _metadata->has_page_stats()
+                               ? count_page_headers_with_pgidx(chunks, selected_row_groups)
+                               : count_page_headers(chunks);
     if (total_pages > 0) {
       hostdevice_vector<gpu::PageInfo> pages(total_pages, total_pages, _stream);
       rmm::device_buffer decomp_page_data;
