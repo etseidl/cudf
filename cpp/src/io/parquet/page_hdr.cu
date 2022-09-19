@@ -361,7 +361,7 @@ __global__ void __launch_bounds__(128)
       bs->page.chunk_idx      = chunk;
       bs->page.src_col_schema = bs->ck.src_col_schema;
 
-      // special case for split chunks
+      // special case for chunks where dictionary page is not contiguous with page data
       if (bs->ck.dictionary_data) {
         bs->base = bs->cur = bs->ck.dictionary_data;
         bs->end            = bs->base + bs->ck.dictionary_size;
