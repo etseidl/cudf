@@ -1165,8 +1165,7 @@ std::future<void> reader::impl::read_column_chunks(
     // if dictionary and page data are split in this chunk, read the dictionary separately.
     // we could possibly read the dictionary for the next chunk with the data for this one,
     // but that gets complicated.  for now just do a little extra I/O
-    // is_contiguous is only false if there is a dictionary.
-    if (not chunks[chunk].is_contiguous) {
+    if (chunks[chunk].dictionary_size) {
       size_t io_offset = column_chunk_offsets[chunk_meta_idx];
       size_t io_size   = chunks[chunk].dictionary_size;
       if (io_size != 0) {
@@ -1216,7 +1215,7 @@ std::future<void> reader::impl::read_column_chunks(
         const size_t next_offset = column_chunk_offsets[l_chunk_meta_idx];
         const bool is_next_compressed =
           (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
-        const bool is_next_contiguous = chunks[next_chunk].is_contiguous;
+        const bool is_next_contiguous = chunks[next_chunk].dictionary_size != 0;
         if (!is_next_contiguous || next_offset != io_offset + io_size ||
             is_next_compressed != is_compressed) {
           // Can't merge if not contiguous or mixing compressed and uncompressed
@@ -1949,8 +1948,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         size_type compressed_size;
         size_type dict_size;
 
-        bool is_contiguous = true;
-
         // translate schema_idx into something we can use for the page indexes
         size_type colidx = 0;
         for (auto const& colchunk : _metadata->get_row_group(rg.index, rg.source_index).columns) {
@@ -1974,7 +1971,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
             if (col_info.dictionary_offset && not col_info.is_contiguous()) {
               column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
               dict_size                         = col_info.dictionary_size;
-              is_contiguous                     = false;
               column_chunk_offsets[chunk_idx]   = col_info.pages[0].location.offset;
             } else {
               dict_size = 0;
@@ -2001,7 +1997,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                               nullptr,
                                               compressed_size,
                                               nullptr,
-                                              is_contiguous,
                                               col_meta.num_values,
                                               schema.type,
                                               type_width,
@@ -2074,7 +2069,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
           if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) {
             page_data[c].reset();
             // if chunk is not contiguous then get rid of extra page_data entry
-            if (not chunks[c].is_contiguous) { page_data[++p].reset(); }
+            if (chunks[c].dictionary_size) { page_data[++p].reset(); }
           }
         }
       }

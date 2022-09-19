@@ -168,7 +168,6 @@ struct ColumnChunkDesc {
                            uint8_t* dictionary_data_,
                            size_t compressed_size_,
                            uint8_t* compressed_data_,
-                           bool is_contiguous_,
                            size_t num_values_,
                            uint16_t datatype_,
                            uint16_t datatype_length_,
@@ -193,7 +192,6 @@ struct ColumnChunkDesc {
       dictionary_data(dictionary_data_),
       compressed_size(compressed_size_),
       compressed_data(compressed_data_),
-      is_contiguous(is_contiguous_),
       num_values(num_values_),
       start_row(start_row_),
       first_page_row(first_page_row_),
@@ -225,7 +223,6 @@ struct ColumnChunkDesc {
   uint8_t const* dictionary_data;                  // pointer to dictionary for this chunk
   size_t compressed_size;                          // total compressed data size for this chunk
   uint8_t const* compressed_data;                  // pointer to compressed column chunk data
-  bool is_contiguous;                              // true if dictionary and data are contiguous
   size_t num_values;                               // total number of values in this column
   size_t start_row;                                // starting row of this chunk
   size_t first_page_row;                           // row index of first page read in this chunk
