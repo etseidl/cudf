@@ -1856,6 +1856,7 @@ void PreprocessColumnData(hostdevice_vector<PageInfo>& pages,
         // number of rows we will allocate/read from the file with the amount specified in the
         // associated row group. This only applies to columns that are not children of lists as
         // those may have an arbitrary number of rows in them.
+        // FIXME(ets): temporary hack until there is a permanent fix for mixed nested/flat schemas
         if (/*!uses_custom_row_bounds &&*/
             !(out_buf.user_data & PARQUET_COLUMN_BUFFER_FLAG_HAS_LIST_PARENT) &&
             size > static_cast<size_type>(num_rows)) {
