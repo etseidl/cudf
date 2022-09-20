@@ -322,8 +322,7 @@ struct metadata : public FileMetaData {
     CUDF_EXPECTS(cp.read(this), "Cannot parse metadata");
     CUDF_EXPECTS(cp.InitSchema(this), "Cannot initialize schema");
 
-    // TODO(ets): terminate early if no index info.  check bounds on row_groups and columns.
-    // not sure if page indexes can be turned off per column or not
+    // read in page-level indexes
     bool has_column_index = false;
     for (auto const& rg : row_groups) {
       for (auto const& col : rg.columns) {
@@ -354,7 +353,7 @@ struct metadata : public FileMetaData {
       }
     }
 
-    if (!has_column_index) {
+    if (!has_column_index || offset_indexes.size() != column_indexes.size()) {
       offset_indexes.clear();
       column_indexes.clear();
     }
@@ -579,21 +578,6 @@ class aggregate_reader_metadata {
     return names;
   }
 
-  // FIXME(ets)
-  // wants:
-  //   need for each source file:
-  //     needed row groups
-  //       src_file_index
-  //       start_row
-  //       column_info for each column requested
-  //         dict_offset
-  //         num_data_pages
-  //         for each data page
-  //           page_location (offset, start_idx (rel to row group), compressed_size)
-  //           num_values (from page header, deferred: do future stuff to read pages then get this
-  //           info)
-  //
-  //
   struct page_info {
     PageLocation location;
     int64_t num_rows;
@@ -633,8 +617,6 @@ class aggregate_reader_metadata {
     auto const& rg  = fmd.row_groups[rgi.index];
     rgi.chunks.resize(rg.columns.size());
 
-    // printf("user bounds (%d, %d)\n", row_start, row_start + row_count);
-
     // now fill in column info for pages that intersect the range
     // [row_start, row_start + row_count)
     for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
@@ -656,9 +638,6 @@ class aggregate_reader_metadata {
           chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
           chunk_info.dictionary_size =
             offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
-          // fix metadata too just in case. not working through const
-          // chunk.meta_data.dictionary_page_offset = chunk.meta_data.data_page_offset;
-          // chunk.meta_data.data_page_offset = offidx.page_locations[0].offset;
         } else {
           chunk_info.dictionary_offset = 0;
           chunk_info.dictionary_size   = 0;
@@ -672,13 +651,13 @@ class aggregate_reader_metadata {
 
       for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
         auto const& page_loc    = offidx.page_locations[pg_idx];
+        // translate chunk-relative row nums to absolute within the file
         auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
         auto const pg_end_row =
           chunk_start_row + (pg_idx == (num_pages - 1)
                                ? rg.num_rows
                                : offidx.page_locations[pg_idx + 1].first_row_index);
         if (range_matches(pg_start_row, pg_end_row)) {
-          // printf("adding col %ld %ld %ld\n", col_idx, pg_start_row, pg_end_row);
           chunk_info.pages.push_back(
             page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
         }
@@ -1162,6 +1141,21 @@ std::future<void> reader::impl::read_column_chunks(
   // Transfer chunk data, coalescing adjacent chunks
   std::vector<std::future<size_t>> read_tasks;
   for (size_t chunk = begin_chunk; chunk < end_chunk;) {
+    auto do_read = [&](size_t io_offset, size_t io_size) {
+      auto& source = _sources[chunk_source_map[chunk]];
+      if (source->is_device_read_preferred(io_size)) {
+        auto buffer        = rmm::device_buffer(io_size, _stream);
+        auto fut_read_size = source->device_read_async(
+          io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
+        read_tasks.emplace_back(std::move(fut_read_size));
+        page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
+      } else {
+        auto const buffer = source->host_read(io_offset, io_size);
+        page_data[chunk_meta_idx] =
+          datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
+      }
+    };
+
     // if dictionary and page data are split in this chunk, read the dictionary separately.
     // we could possibly read the dictionary for the next chunk with the data for this one,
     // but that gets complicated.  for now just do a little extra I/O
@@ -1169,6 +1163,8 @@ std::future<void> reader::impl::read_column_chunks(
       size_t io_offset = column_chunk_offsets[chunk_meta_idx];
       size_t io_size   = chunks[chunk].dictionary_size;
       if (io_size != 0) {
+        do_read(io_offset, io_size);
+#if 0
         auto& source = _sources[chunk_source_map[chunk]];
         if (source->is_device_read_preferred(io_size)) {
           auto buffer        = rmm::device_buffer(io_size, _stream);
@@ -1181,6 +1177,7 @@ std::future<void> reader::impl::read_column_chunks(
           page_data[chunk_meta_idx] =
             datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
         }
+#endif
         chunks[chunk].dictionary_data = page_data[chunk_meta_idx]->data();
       }
 
@@ -1188,6 +1185,8 @@ std::future<void> reader::impl::read_column_chunks(
       io_offset = column_chunk_offsets[++chunk_meta_idx];
       io_size   = chunks[chunk].compressed_size;
       if (io_size != 0) {
+        do_read(io_offset, io_size);
+#if 0
         auto& source = _sources[chunk_source_map[chunk]];
         if (source->is_device_read_preferred(io_size)) {
           auto buffer        = rmm::device_buffer(io_size, _stream);
@@ -1200,6 +1199,7 @@ std::future<void> reader::impl::read_column_chunks(
           page_data[chunk_meta_idx] =
             datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
         }
+#endif
         chunks[chunk].compressed_data = page_data[chunk_meta_idx]->data();
       }
 
@@ -1228,6 +1228,8 @@ std::future<void> reader::impl::read_column_chunks(
         l_chunk_meta_idx++;
       }
       if (io_size != 0) {
+        do_read(io_offset, io_size);
+#if 0
         auto& source = _sources[chunk_source_map[chunk]];
         if (source->is_device_read_preferred(io_size)) {
           auto buffer        = rmm::device_buffer(io_size, _stream);
@@ -1240,6 +1242,7 @@ std::future<void> reader::impl::read_column_chunks(
           page_data[chunk_meta_idx] =
             datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
         }
+#endif
         auto d_compdata = page_data[chunk_meta_idx]->data();
         do {
           chunks[chunk].compressed_data = d_compdata;
@@ -1279,9 +1282,7 @@ void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
                        std::vector<aggregate_reader_metadata::row_group_info> const& row_groups)
 {
   // fill in page_info num_null using page index if available
-  // TODO(ets): not sure if it will ever be used though, so maybe remove
-  // also fix page chunk_row and num_rows, although these will be correct for
-  // flat schemas and later corrected for nested schemas (but maybe can skip that now???)
+  // also fix page chunk_row and num_rows
   for (size_t c = 0, page_count = 0; c < chunks.size(); c++) {
     auto const& chunk    = chunks[c];
     auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
@@ -1899,7 +1900,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         }
       }
     }
-    // printf("read:num_extra_pages %d\n", num_extra_pages);
 
     // Association between each column chunk and its source
     std::vector<size_type> chunk_source_map(num_chunks);
@@ -1957,7 +1957,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
 
         if (uses_custom_row_bounds && rg.has_page_index()) {
           auto const& col_info = rg.chunks[colidx];
-          // printf("  npages %ld\n", col_info.pages.size());
           if (col_info.pages.size() == 0) {
             dict_size       = 0;
             compressed_size = 0;
@@ -1967,7 +1966,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                 return page.location.compressed_page_size;
               });
             compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
-            // printf("  is contig %d %ld\n", col_info.is_contiguous(), col_info.dictionary_offset);
             if (col_info.dictionary_offset && not col_info.is_contiguous()) {
               column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
               dict_size                         = col_info.dictionary_size;
@@ -1983,7 +1981,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
             // override row_group_start and row_group_rows
             first_page_row = col_info.pages[0].location.first_row_index;
           }
-          // printf("compsz %d dictsz %d\n", compressed_size, dict_size);
         } else {
           dict_size       = 0;
           compressed_size = col_meta.total_compressed_size;
@@ -2029,7 +2026,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         chunk_idx++;
       }
       // Read compressed chunk data to device memory
-      // printf("read rowgroups %ld %ld %ld\n", io_chunk_idx, start_chunk_idx, chunks.size());
       read_rowgroup_tasks.push_back(read_column_chunks(page_data,
                                                        chunks,
                                                        io_chunk_idx,
