@@ -1164,20 +1164,6 @@ std::future<void> reader::impl::read_column_chunks(
       size_t io_size   = chunks[chunk].dictionary_size;
       if (io_size != 0) {
         do_read(io_offset, io_size, chunk_meta_idx);
-#if 0
-        auto& source = _sources[chunk_source_map[chunk]];
-        if (source->is_device_read_preferred(io_size)) {
-          auto buffer        = rmm::device_buffer(io_size, _stream);
-          auto fut_read_size = source->device_read_async(
-            io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
-          read_tasks.emplace_back(std::move(fut_read_size));
-          page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
-        } else {
-          auto const buffer = source->host_read(io_offset, io_size);
-          page_data[chunk_meta_idx] =
-            datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
-        }
-#endif
         chunks[chunk].dictionary_data = page_data[chunk_meta_idx]->data();
       }
 
@@ -1186,20 +1172,6 @@ std::future<void> reader::impl::read_column_chunks(
       io_size   = chunks[chunk].compressed_size;
       if (io_size != 0) {
         do_read(io_offset, io_size, chunk_meta_idx);
-#if 0
-        auto& source = _sources[chunk_source_map[chunk]];
-        if (source->is_device_read_preferred(io_size)) {
-          auto buffer        = rmm::device_buffer(io_size, _stream);
-          auto fut_read_size = source->device_read_async(
-            io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
-          read_tasks.emplace_back(std::move(fut_read_size));
-          page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
-        } else {
-          auto const buffer = source->host_read(io_offset, io_size);
-          page_data[chunk_meta_idx] =
-            datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
-        }
-#endif
         chunks[chunk].compressed_data = page_data[chunk_meta_idx]->data();
       }
 
@@ -1229,20 +1201,6 @@ std::future<void> reader::impl::read_column_chunks(
       }
       if (io_size != 0) {
         do_read(io_offset, io_size, chunk_meta_idx);
-#if 0
-        auto& source = _sources[chunk_source_map[chunk]];
-        if (source->is_device_read_preferred(io_size)) {
-          auto buffer        = rmm::device_buffer(io_size, _stream);
-          auto fut_read_size = source->device_read_async(
-            io_offset, io_size, static_cast<uint8_t*>(buffer.data()), _stream);
-          read_tasks.emplace_back(std::move(fut_read_size));
-          page_data[chunk_meta_idx] = datasource::buffer::create(std::move(buffer));
-        } else {
-          auto const buffer = source->host_read(io_offset, io_size);
-          page_data[chunk_meta_idx] =
-            datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), _stream));
-        }
-#endif
         auto d_compdata = page_data[chunk_meta_idx]->data();
         do {
           chunks[chunk].compressed_data = d_compdata;
