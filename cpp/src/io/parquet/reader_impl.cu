@@ -1187,7 +1187,7 @@ std::future<void> reader::impl::read_column_chunks(
         const size_t next_offset = column_chunk_offsets[l_chunk_meta_idx];
         const bool is_next_compressed =
           (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
-        const bool is_next_contiguous = chunks[next_chunk].dictionary_size != 0;
+        const bool is_next_contiguous = chunks[next_chunk].dictionary_size == 0;
         if (!is_next_contiguous || next_offset != io_offset + io_size ||
             is_next_compressed != is_compressed) {
           // Can't merge if not contiguous or mixing compressed and uncompressed
