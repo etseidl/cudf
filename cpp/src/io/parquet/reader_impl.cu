@@ -2018,12 +2018,14 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       if (total_decompressed_size > 0) {
         decomp_page_data = decompress_page_data(chunks, pages);
         // Free compressed data
-        for (size_t c = 0, p = 0; c < chunks.size(); c++, p++) {
+        for (size_t c = 0, p = 0; c < chunks.size(); c++) {
           // need to check for discontiguous page dictionaries
           if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) {
-            page_data[c].reset();
+            page_data[p++].reset();
             // if chunk is not contiguous then get rid of extra page_data entry
-            if (chunks[c].dictionary_size) { page_data[++p].reset(); }
+            if (chunks[c].dictionary_size) { page_data[p++].reset(); }
+          } else {
+            p += chunks[c].dictionary_size ? 2 : 1;
           }
         }
       }
