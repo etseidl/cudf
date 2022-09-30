@@ -221,13 +221,18 @@ struct ColumnChunkDesc {
   {
   }
 
+  // dictionary fields will only be set when the dictionary is not contiguous with the
+  // the page data (i.e. when skipping data pages)
   size_t dictionary_size;                          // dictionary size for this chunk
   uint8_t const* dictionary_data;                  // pointer to dictionary for this chunk
   size_t compressed_size;                          // total compressed data size for this chunk
   uint8_t const* compressed_data;                  // pointer to compressed column chunk data
   size_t num_values;                               // total number of values in this column
-  size_t start_row;                                // starting row of this chunk
+  size_t start_row;                                // starting row of this chunk relative to start
+                                                   // of file
   size_t first_page_row;                           // row index of first page read in this chunk
+                                                   // relative to start of chunk. 0 unless skipping
+                                                   // pages
   uint32_t num_rows;                               // number of rows in this chunk
   int16_t max_level[level_type::NUM_LEVEL_TYPES];  // max definition/repetition level
   int16_t max_nesting_depth;                       // max nesting depth of the output

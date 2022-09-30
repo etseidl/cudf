@@ -1961,7 +1961,6 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                                                   : col_info.pages[0].location.offset;
             }
 
-            // override row_group_start and row_group_rows
             first_page_row = col_info.pages[0].location.first_row_index;
           }
         } else {
