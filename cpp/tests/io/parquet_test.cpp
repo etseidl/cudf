@@ -2688,9 +2688,9 @@ TEST_F(ParquetReaderTest, MixedUserBoundsWithNullsLarge)
   // this file will have row groups of 1,000,000 each
   cudf::table_view tbl({col0, col1});
   auto filepath = temp_env->get_temp_filepath("MixedUserBoundsWithNullsLarge.parquet");
-  cudf_io::parquet_writer_options out_args =
-    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, tbl);
-  cudf_io::write_parquet(out_args);
+  cudf::io::parquet_writer_options out_args =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, tbl);
+  cudf::io::write_parquet(out_args);
 
   // skip_rows / num_rows
   // clang-format off
@@ -2702,11 +2702,11 @@ TEST_F(ParquetReaderTest, MixedUserBoundsWithNullsLarge)
                                            {4001231, 17}, {1900000, 989999}, {4999999, 1} };
   // clang-format on
   for (auto p : params) {
-    cudf_io::parquet_reader_options read_args =
-      cudf::io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+    cudf::io::parquet_reader_options read_args =
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
     if (p.first >= 0) { read_args.set_skip_rows(p.first); }
     if (p.second >= 0) { read_args.set_num_rows(p.second); }
-    auto result = cudf_io::read_parquet(read_args);
+    auto result = cudf::io::read_parquet(read_args);
 
     p.first  = p.first < 0 ? 0 : p.first;
     p.second = p.second < 0 ? static_cast<cudf::column_view>(col0).size() - p.first : p.second;
