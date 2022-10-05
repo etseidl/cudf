@@ -1906,6 +1906,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     // Keep track of column chunk file offsets
     std::vector<size_t> column_chunk_offsets(num_chunks + num_extra_pages);
 
+    // if there are lists present, we need to preprocess
+    bool has_lists = false;
+
     // Initialize column chunk information
     size_t total_decompressed_size = 0;
     auto remaining_rows            = num_rows;
@@ -1927,6 +1930,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
         // look up metadata
         auto& col_meta = _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
         auto& schema   = _metadata->get_schema(col.schema_idx);
+
+        // this column contains repetition levels and will require a preprocess
+        if (schema.max_repetition_level > 0) { has_lists = true; }
 
         auto [type_width, clock_rate, converted_type] =
           conversion_info(to_type_id(schema, _strings_to_categorical, _timestamp_type.id()),
