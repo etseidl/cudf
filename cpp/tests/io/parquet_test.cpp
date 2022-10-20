@@ -718,17 +718,17 @@ TEST_F(ParquetWriterTest, StringsAsBinary)
   column_wrapper<cudf::string_view> col0{ascii_strings.begin(), ascii_strings.end()};
   column_wrapper<cudf::string_view> col1{unicode_strings.begin(), unicode_strings.end()};
   column_wrapper<cudf::string_view> col2{ascii_strings.begin(), ascii_strings.end()};
-  cudf::test::lists_column_wrapper<int8_t> col3{{'M', 'o', 'n', 'd', 'a', 'y'},
-                                                {'W', 'e', 'd', 'n', 'e', 's', 'd', 'a', 'y'},
-                                                {'F', 'r', 'i', 'd', 'a', 'y'},
-                                                {'M', 'o', 'n', 'd', 'a', 'y'},
-                                                {'F', 'r', 'i', 'd', 'a', 'y'},
-                                                {'F', 'r', 'i', 'd', 'a', 'y'},
-                                                {'F', 'r', 'i', 'd', 'a', 'y'},
-                                                {'F', 'u', 'n', 'd', 'a', 'y'}};
-  cudf::test::lists_column_wrapper<int8_t> col4{
+  cudf::test::lists_column_wrapper<uint8_t> col3{{'M', 'o', 'n', 'd', 'a', 'y'},
+                                                 {'W', 'e', 'd', 'n', 'e', 's', 'd', 'a', 'y'},
+                                                 {'F', 'r', 'i', 'd', 'a', 'y'},
+                                                 {'M', 'o', 'n', 'd', 'a', 'y'},
+                                                 {'F', 'r', 'i', 'd', 'a', 'y'},
+                                                 {'F', 'r', 'i', 'd', 'a', 'y'},
+                                                 {'F', 'r', 'i', 'd', 'a', 'y'},
+                                                 {'F', 'u', 'n', 'd', 'a', 'y'}};
+  cudf::test::lists_column_wrapper<uint8_t> col4{
     {'M', 'o', 'n', 'd', 'a', 'y'},
-    {'W', -56, -123, 'd', 'n', -56, -123, 's', 'd', 'a', 'y'},
+    {'W', 200, 133, 'd', 'n', 200, 133, 's', 'd', 'a', 'y'},
     {'F', 'r', 'i', 'd', 'a', 'y'},
     {'M', 'o', 'n', 'd', 'a', 'y'},
     {'F', 'r', 'i', 'd', 'a', 'y'},
@@ -2633,6 +2633,11 @@ TEST_F(ParquetReaderTest, UserBoundsWithNullsMixedTypes)
     0, [string_per_row](cudf::size_type idx) { return idx * string_per_row; });
   cudf::test::fixed_width_column_wrapper<cudf::offset_type> offsets(offset_iter,
                                                                     offset_iter + num_rows + 1);
+
+  auto _c3_valids =
+    cudf::detail::make_counting_transform_iterator(0, [&](int index) { return index % 200; });
+  std::vector<bool> c3_valids(num_rows);
+  std::copy(_c3_valids, _c3_valids + num_rows, c3_valids.begin());
   auto _c3_list =
     cudf::make_lists_column(num_rows,
                             offsets.release(),
@@ -2646,7 +2651,7 @@ TEST_F(ParquetReaderTest, UserBoundsWithNullsMixedTypes)
   c3_children.push_back(std::move(c3_list));
   c3_children.push_back(c3_ints.release());
   c3_children.push_back(c3_floats.release());
-  cudf::test::structs_column_wrapper _c3(std::move(c3_children));
+  cudf::test::structs_column_wrapper _c3(std::move(c3_children), c3_valids);
   auto c3 = cudf::purge_nonempty_nulls(static_cast<cudf::structs_column_view>(_c3));
 
   // write it out
@@ -4454,13 +4459,13 @@ TEST_F(ParquetReaderTest, BinaryAsStrings)
 
   auto seq_col0 = random_values<int>(num_rows);
   auto seq_col2 = random_values<float>(num_rows);
-  auto seq_col3 = random_values<int8_t>(num_rows);
+  auto seq_col3 = random_values<uint8_t>(num_rows);
   auto validity = cudf::test::iterators::no_nulls();
 
   column_wrapper<int> int_col{seq_col0.begin(), seq_col0.end(), validity};
   column_wrapper<cudf::string_view> string_col{strings.begin(), strings.end()};
   column_wrapper<float> float_col{seq_col2.begin(), seq_col2.end(), validity};
-  cudf::test::lists_column_wrapper<int8_t> list_int_col{
+  cudf::test::lists_column_wrapper<uint8_t> list_int_col{
     {'M', 'o', 'n', 'd', 'a', 'y'},
     {'W', 'e', 'd', 'n', 'e', 's', 'd', 'a', 'y'},
     {'F', 'r', 'i', 'd', 'a', 'y'},
@@ -4521,12 +4526,12 @@ TEST_F(ParquetReaderTest, NestedByteArray)
 
   auto seq_col0       = random_values<int>(num_rows);
   auto seq_col2       = random_values<float>(num_rows);
-  auto seq_col3       = random_values<int8_t>(num_rows);
+  auto seq_col3       = random_values<uint8_t>(num_rows);
   auto const validity = cudf::test::iterators::no_nulls();
 
   column_wrapper<int> int_col{seq_col0.begin(), seq_col0.end(), validity};
   column_wrapper<float> float_col{seq_col2.begin(), seq_col2.end(), validity};
-  cudf::test::lists_column_wrapper<int8_t> list_list_int_col{
+  cudf::test::lists_column_wrapper<uint8_t> list_list_int_col{
     {{'M', 'o', 'n', 'd', 'a', 'y'},
      {'W', 'e', 'd', 'n', 'e', 's', 'd', 'a', 'y'},
      {'F', 'r', 'i', 'd', 'a', 'y'}},
@@ -4632,12 +4637,12 @@ TEST_F(ParquetReaderTest, StructByteArray)
 {
   constexpr auto num_rows = 100;
 
-  auto seq_col0       = random_values<int8_t>(num_rows);
+  auto seq_col0       = random_values<uint8_t>(num_rows);
   auto const validity = cudf::test::iterators::no_nulls();
 
-  column_wrapper<int8_t> int_col{seq_col0.begin(), seq_col0.end(), validity};
-  cudf::test::lists_column_wrapper<int8_t> list_of_int{{seq_col0.begin(), seq_col0.begin() + 50},
-                                                       {seq_col0.begin() + 50, seq_col0.end()}};
+  column_wrapper<uint8_t> int_col{seq_col0.begin(), seq_col0.end(), validity};
+  cudf::test::lists_column_wrapper<uint8_t> list_of_int{{seq_col0.begin(), seq_col0.begin() + 50},
+                                                        {seq_col0.begin() + 50, seq_col0.end()}};
   auto struct_col = cudf::test::structs_column_wrapper{{list_of_int}, validity};
 
   auto const expected = table_view{{struct_col}};
