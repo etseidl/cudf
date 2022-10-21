@@ -372,6 +372,10 @@ __global__ void __launch_bounds__(128)
           bs->page.chunk_row = 0;
           bs->page.flags     = PAGEINFO_FLAGS_DICTIONARY;
           bs->page.page_data = const_cast<uint8_t*>(bs->cur);
+          // zero out V2 info
+          bs->page.num_nulls     = 0;
+          bs->page.def_lvl_bytes = 0;
+          bs->page.rep_lvl_bytes = 0;
           if (bs->ck.page_info) { bs->ck.page_info[0] = bs->page; }
           dictionary_page_count++;
         }
