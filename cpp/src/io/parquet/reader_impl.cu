@@ -650,7 +650,7 @@ class aggregate_reader_metadata {
       };
 
       for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
-        auto const& page_loc    = offidx.page_locations[pg_idx];
+        auto const& page_loc = offidx.page_locations[pg_idx];
         // translate chunk-relative row nums to absolute within the file
         auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
         auto const pg_end_row =
