@@ -633,7 +633,7 @@ class aggregate_reader_metadata {
 
       // bug in parquet-mr does not write dictionary offsets, so check to
       // see if data_page_offset differs from first entry in offsets index
-      if (chunk.meta_data.dictionary_page_offset) {
+      if (chunk.meta_data.dictionary_page_offset > 0) {
         chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
         chunk_info.dictionary_size =
           chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
@@ -1884,8 +1884,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     const auto num_chunks        = selected_row_groups.size() * num_input_columns;
     hostdevice_vector<gpu::ColumnChunkDesc> chunks(0, num_chunks, _stream);
 
-    // if using custom bounds, need to account for non-contiguous dictionary
-    // pages
+    // if using custom bounds, need to account for non-contiguous dictionary pages
     int num_extra_pages = 0;
     if (uses_custom_row_bounds) {
       for (auto const& rg : selected_row_groups) {
@@ -1929,10 +1928,11 @@ table_with_metadata reader::impl::read(size_type skip_rows,
       // generate ColumnChunkDesc objects for everything to be decoded (all input columns)
       for (size_t i = 0; i < num_input_columns; ++i) {
         size_t first_page_row = 0;
-        auto col              = _input_columns[i];
+        auto const col        = _input_columns[i];
         // look up metadata
-        auto& col_meta = _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
-        auto& schema   = _metadata->get_schema(col.schema_idx);
+        auto const& col_meta =
+          _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
+        auto const& schema = _metadata->get_schema(col.schema_idx);
 
         // this column contains repetition levels and will require a preprocess
         if (schema.max_repetition_level > 0) { has_lists = true; }

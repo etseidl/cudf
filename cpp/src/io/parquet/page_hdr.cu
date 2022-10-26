@@ -362,7 +362,7 @@ __global__ void __launch_bounds__(128)
       bs->page.src_col_schema = bs->ck.src_col_schema;
 
       // special case for chunks where dictionary page is not contiguous with page data
-      if (bs->ck.dictionary_data) {
+      if (bs->ck.dictionary_data != nullptr) {
         bs->base = bs->cur = bs->ck.dictionary_data;
         bs->end            = bs->base + bs->ck.dictionary_size;
         if (parse_page_header(bs)) {
