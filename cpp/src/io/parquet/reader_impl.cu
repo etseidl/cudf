@@ -319,18 +319,21 @@ struct metadata : public FileMetaData {
 
     const auto buffer = source->host_read(len - ender->footer_len - ender_len, ender->footer_len);
     CompactProtocolReader cp(buffer->data(), ender->footer_len);
-    CUDF_EXPECTS(cp.read(this), "Cannot parse metadata");
-    CUDF_EXPECTS(cp.InitSchema(this), "Cannot initialize schema");
+    bool res = cp.read(this);
+    CUDF_EXPECTS(res, "Cannot parse metadata");
+    res = cp.InitSchema(this);
+    CUDF_EXPECTS(res, "Cannot initialize schema");
 
     // read in page-level indexes
     bool has_column_index = false;
     for (auto const& rg : row_groups) {
       for (auto const& col : rg.columns) {
         if (col.offset_index_offset > 0) {
-          const auto buf = source->host_read(col.offset_index_offset, col.offset_index_length);
+          auto const buf = source->host_read(col.offset_index_offset, col.offset_index_length);
           cp.init(buf->data(), buf->size());
           OffsetIndex oi;
-          CUDF_EXPECTS(cp.read(&oi), "Cannot parse offset index");
+          res = cp.read(&oi);
+          CUDF_EXPECTS(res, "Cannot parse offset index");
           offset_indexes.push_back(std::move(oi));
           has_column_index = true;
         } else {
@@ -342,7 +345,8 @@ struct metadata : public FileMetaData {
           const auto buf = source->host_read(col.column_index_offset, col.column_index_length);
           cp.init(buf->data(), buf->size());
           ColumnIndex ci;
-          CUDF_EXPECTS(cp.read(&ci), "Cannot parse offset index");
+          res = cp.read(&ci);
+          CUDF_EXPECTS(res, "Cannot parse offset index");
           column_indexes.push_back(std::move(ci));
           has_column_index = true;
         } else {
@@ -620,12 +624,12 @@ class aggregate_reader_metadata {
     // now fill in column info for pages that intersect the range
     // [row_start, row_start + row_count)
     for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
-      auto const& chunk  = rg.columns[col_idx];
-      auto& chunk_info   = rgi.chunks[col_idx];
-      auto const idx_idx = rgi.index * rg.columns.size() + col_idx;
-      auto const& offidx = fmd.offset_indexes[idx_idx];
-      auto const& colidx = fmd.column_indexes[idx_idx];
-      auto num_pages     = offidx.page_locations.size();
+      auto const& chunk    = rg.columns[col_idx];
+      auto& chunk_info     = rgi.chunks[col_idx];
+      auto const idx_idx   = rgi.index * rg.columns.size() + col_idx;
+      auto const& offidx   = fmd.offset_indexes[idx_idx];
+      auto const& colidx   = fmd.column_indexes[idx_idx];
+      auto const num_pages = offidx.page_locations.size();
 
       // bug in parquet-mr does not write dictionary offsets, so check to
       // see if data_page_offset differs from first entry in offsets index
@@ -634,7 +638,7 @@ class aggregate_reader_metadata {
         chunk_info.dictionary_size =
           chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
       } else {
-        if (num_pages && chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
+        if (num_pages > 0 && chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
           chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
           chunk_info.dictionary_size =
             offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
@@ -1159,7 +1163,7 @@ std::future<void> reader::impl::read_column_chunks(
     // if dictionary and page data are split in this chunk, read the dictionary separately.
     // we could possibly read the dictionary for the next chunk with the data for this one,
     // but that gets complicated.  for now just do a little extra I/O
-    if (chunks[chunk].dictionary_size) {
+    if (chunks[chunk].dictionary_size > 0) {
       size_t io_offset = column_chunk_offsets[chunk_meta_idx];
       size_t io_size   = chunks[chunk].dictionary_size;
       if (io_size != 0) {
@@ -1914,8 +1918,8 @@ table_with_metadata reader::impl::read(size_type skip_rows,
     size_t chunk_idx               = 0;
     std::vector<std::future<void>> read_rowgroup_tasks;
     for (size_t rg_idx = 0; rg_idx < selected_row_groups.size(); rg_idx++) {
-      const auto& rg              = selected_row_groups[rg_idx];
-      const auto& row_group       = _metadata->get_row_group(rg.index, rg.source_index);
+      auto const& rg              = selected_row_groups[rg_idx];
+      auto const& row_group       = _metadata->get_row_group(rg.index, rg.source_index);
       auto const row_group_start  = rg.start_row;
       auto const row_group_source = rg.source_index;
       auto const row_group_rows   = std::min<int>(remaining_rows, row_group.num_rows);
@@ -1961,14 +1965,14 @@ table_with_metadata reader::impl::read(size_type skip_rows,
                 return page.location.compressed_page_size;
               });
             compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
-            if (col_info.dictionary_offset && not col_info.is_contiguous()) {
+            if (col_info.dictionary_offset > 0 && not col_info.is_contiguous()) {
               column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
               dict_size                         = col_info.dictionary_size;
               column_chunk_offsets[chunk_idx]   = col_info.pages[0].location.offset;
             } else {
               dict_size = 0;
               compressed_size += col_info.dictionary_size;
-              column_chunk_offsets[chunk_idx] = col_info.dictionary_offset
+              column_chunk_offsets[chunk_idx] = col_info.dictionary_offset > 0
                                                   ? col_info.dictionary_offset
                                                   : col_info.pages[0].location.offset;
             }
@@ -1979,7 +1983,7 @@ table_with_metadata reader::impl::read(size_type skip_rows,
           dict_size       = 0;
           compressed_size = col_meta.total_compressed_size;
           column_chunk_offsets[chunks.size()] =
-            col_meta.dictionary_page_offset
+            col_meta.dictionary_page_offset > 0
               ? std::min(col_meta.data_page_offset, col_meta.dictionary_page_offset)
               : col_meta.data_page_offset;
         }
@@ -2059,9 +2063,9 @@ table_with_metadata reader::impl::read(size_type skip_rows,
           if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) {
             page_data[p++].reset();
             // if chunk is not contiguous then get rid of extra page_data entry
-            if (chunks[c].dictionary_size) { page_data[p++].reset(); }
+            if (chunks[c].dictionary_size > 0) { page_data[p++].reset(); }
           } else {
-            p += chunks[c].dictionary_size ? 2 : 1;
+            p += chunks[c].dictionary_size > 0 ? 2 : 1;
           }
         }
       }

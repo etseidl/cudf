@@ -357,7 +357,7 @@ __global__ void __launch_bounds__(128)
     int32_t num_dict_pages = bs->ck.num_dict_pages;
     PageInfo* page_info;
 
-    if (!lane_id) {
+    if (lane_id == 0) {
       bs->page.chunk_idx      = chunk;
       bs->page.src_col_schema = bs->ck.src_col_schema;
 
@@ -376,7 +376,7 @@ __global__ void __launch_bounds__(128)
           bs->page.num_nulls     = 0;
           bs->page.def_lvl_bytes = 0;
           bs->page.rep_lvl_bytes = 0;
-          if (bs->ck.page_info) { bs->ck.page_info[0] = bs->page; }
+          if (bs->ck.page_info != nullptr) { bs->ck.page_info[0] = bs->page; }
           dictionary_page_count++;
         }
       }
@@ -392,7 +392,7 @@ __global__ void __launch_bounds__(128)
     }
     num_values    = bs->ck.num_values;
     page_info     = bs->ck.page_info;
-    max_num_pages = (page_info) ? bs->ck.max_num_pages : 0;
+    max_num_pages = (page_info != nullptr) ? bs->ck.max_num_pages : 0;
     values_found  = 0;
     __syncwarp();
     while (values_found < num_values && bs->cur < bs->end) {
