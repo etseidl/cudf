@@ -219,6 +219,7 @@ template <typename T = uint8_t>
  * @param end_chunk Index after the last column chunk to read
  * @param column_chunk_offsets File offset for all chunks
  * @param chunk_source_map Association between each column chunk and its source
+ * @param chunk_meta_idx Starting offset into page_data and column_chunk_offsets
  * @param stream CUDA stream used for device memory operations and kernel launches
  *
  * @return A future object for reading synchronization
@@ -231,48 +232,81 @@ template <typename T = uint8_t>
   size_t end_chunk,
   const std::vector<size_t>& column_chunk_offsets,
   std::vector<size_type> const& chunk_source_map,
+  size_t chunk_meta_idx,
   rmm::cuda_stream_view stream)
 {
   // Transfer chunk data, coalescing adjacent chunks
   std::vector<std::future<size_t>> read_tasks;
   for (size_t chunk = begin_chunk; chunk < end_chunk;) {
-    const size_t io_offset   = column_chunk_offsets[chunk];
-    size_t io_size           = chunks[chunk].compressed_size;
-    size_t next_chunk        = chunk + 1;
-    const bool is_compressed = (chunks[chunk].codec != parquet::Compression::UNCOMPRESSED);
-    while (next_chunk < end_chunk) {
-      const size_t next_offset = column_chunk_offsets[next_chunk];
-      const bool is_next_compressed =
-        (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
-      if (next_offset != io_offset + io_size || is_next_compressed != is_compressed) {
-        // Can't merge if not contiguous or mixing compressed and uncompressed
-        // Not coalescing uncompressed with compressed chunks is so that compressed buffers can be
-        // freed earlier (immediately after decompression stage) to limit peak memory requirements
-        break;
-      }
-      io_size += chunks[next_chunk].compressed_size;
-      next_chunk++;
-    }
-    if (io_size != 0) {
+    auto do_read = [&](size_t io_offset, size_t io_size, size_t chunk_idx) {
       auto& source = sources[chunk_source_map[chunk]];
       if (source->is_device_read_preferred(io_size)) {
         auto buffer        = rmm::device_buffer(io_size, stream);
         auto fut_read_size = source->device_read_async(
           io_offset, io_size, static_cast<uint8_t*>(buffer.data()), stream);
         read_tasks.emplace_back(std::move(fut_read_size));
-        page_data[chunk] = datasource::buffer::create(std::move(buffer));
+        page_data[chunk_idx] = datasource::buffer::create(std::move(buffer));
       } else {
         auto const buffer = source->host_read(io_offset, io_size);
-        page_data[chunk] =
+        page_data[chunk_idx] =
           datasource::buffer::create(rmm::device_buffer(buffer->data(), buffer->size(), stream));
       }
-      auto d_compdata = page_data[chunk]->data();
-      do {
-        chunks[chunk].compressed_data = d_compdata;
-        d_compdata += chunks[chunk].compressed_size;
-      } while (++chunk != next_chunk);
+    };
+
+    // if dictionary and page data are split in this chunk, read the dictionary separately.
+    // we could possibly read the dictionary for the next chunk with the data for this one,
+    // but that gets complicated.  for now just do a little extra I/O
+    if (chunks[chunk].dictionary_size > 0) {
+      size_t io_offset = column_chunk_offsets[chunk_meta_idx];
+      size_t io_size   = chunks[chunk].dictionary_size;
+      if (io_size != 0) {
+        do_read(io_offset, io_size, chunk_meta_idx);
+        chunks[chunk].dictionary_data = page_data[chunk_meta_idx]->data();
+      }
+
+      // now read page data
+      io_offset = column_chunk_offsets[++chunk_meta_idx];
+      io_size   = chunks[chunk].compressed_size;
+      if (io_size != 0) {
+        do_read(io_offset, io_size, chunk_meta_idx);
+        chunks[chunk].compressed_data = page_data[chunk_meta_idx]->data();
+      }
+
+      chunk++;
+      chunk_meta_idx++;
     } else {
-      chunk = next_chunk;
+      const size_t io_offset   = column_chunk_offsets[chunk_meta_idx];
+      size_t io_size           = chunks[chunk].compressed_size;
+      size_t next_chunk        = chunk + 1;
+      const bool is_compressed = (chunks[chunk].codec != parquet::Compression::UNCOMPRESSED);
+      auto l_chunk_meta_idx    = chunk_meta_idx + 1;
+      while (next_chunk < end_chunk) {
+        const size_t next_offset = column_chunk_offsets[l_chunk_meta_idx];
+        const bool is_next_compressed =
+          (chunks[next_chunk].codec != parquet::Compression::UNCOMPRESSED);
+        const bool is_next_contiguous = chunks[next_chunk].dictionary_size == 0;
+        if (!is_next_contiguous || next_offset != io_offset + io_size ||
+            is_next_compressed != is_compressed) {
+          // Can't merge if not contiguous or mixing compressed and uncompressed
+          // Not coalescing uncompressed with compressed chunks is so that compressed buffers can be
+          // freed earlier (immediately after decompression stage) to limit peak memory requirements
+          break;
+        }
+        io_size += chunks[next_chunk].compressed_size;
+        next_chunk++;
+        l_chunk_meta_idx++;
+      }
+      if (io_size != 0) {
+        do_read(io_offset, io_size, chunk_meta_idx);
+        auto d_compdata = page_data[chunk_meta_idx]->data();
+        do {
+          chunks[chunk].compressed_data = d_compdata;
+          d_compdata += chunks[chunk].compressed_size;
+        } while (++chunk != next_chunk);
+      } else {
+        chunk = next_chunk;
+      }
+      chunk_meta_idx = l_chunk_meta_idx;
     }
   }
   auto sync_fn = [](decltype(read_tasks) read_tasks) {
@@ -282,6 +316,43 @@ template <typename T = uint8_t>
   };
   return std::async(std::launch::deferred, sync_fn, std::move(read_tasks));
 }
+
+namespace {
+
+size_t count_page_headers_with_pgidx(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
+                                     std::vector<row_group_info> const& row_groups)
+{
+  size_t total_pages = 0;
+  for (auto& chunk : chunks) {
+    auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
+    chunk.num_dict_pages = col_info.dictionary_offset > 0 ? 1 : 0;
+    chunk.num_data_pages = col_info.pages.size();
+    total_pages += chunk.num_data_pages + chunk.num_dict_pages;
+  }
+  return total_pages;
+}
+
+void fill_in_page_info(hostdevice_vector<gpu::ColumnChunkDesc>& chunks,
+                       hostdevice_vector<gpu::PageInfo>& pages,
+                       std::vector<row_group_info> const& row_groups)
+{
+  // fill in page_info num_null using page index if available
+  // also fix page chunk_row and num_rows
+  for (size_t c = 0, page_count = 0; c < chunks.size(); c++) {
+    auto const& chunk    = chunks[c];
+    auto const& col_info = row_groups[chunk.row_group_idx].chunks[chunk.pgidx_col_idx];
+    size_t start_row     = chunk.first_page_row;
+    page_count += chunk.num_dict_pages;
+    for (size_t p = 0; p < col_info.pages.size(); p++, page_count++) {
+      pages[page_count].num_rows  = col_info.pages[p].num_rows;
+      pages[page_count].chunk_row = start_row;
+      pages[page_count].num_nulls = col_info.pages[p].num_nulls;
+      start_row += pages[page_count].num_rows;
+    }
+  }
+}
+
+}  // namespace
 
 /**
  * @brief Return the number of total pages from the given column chunks.
@@ -643,7 +714,8 @@ void reader::impl::allocate_nesting_info()
 }
 
 void reader::impl::load_and_decompress_data(std::vector<row_group_info> const& row_groups_info,
-                                            size_type num_rows)
+                                            size_type num_rows,
+                                            bool uses_custom_row_bounds)
 {
   // This function should never be called if `num_rows == 0`.
   CUDF_EXPECTS(num_rows > 0, "Number of reading rows must not be zero.");
@@ -658,32 +730,55 @@ void reader::impl::load_and_decompress_data(std::vector<row_group_info> const& r
   const auto num_chunks        = row_groups_info.size() * num_input_columns;
   chunks                       = hostdevice_vector<gpu::ColumnChunkDesc>(0, num_chunks, _stream);
 
+  // if using custom bounds, need to account for non-contiguous dictionary pages
+  int num_extra_pages = 0;
+  if (uses_custom_row_bounds) {
+    for (auto const& rg : row_groups_info) {
+      if (rg.has_page_index()) {
+        auto contig = thrust::make_transform_iterator(
+          rg.chunks.begin(), [](auto const& chunk) { return chunk.is_contiguous() ? 0 : 1; });
+        num_extra_pages = thrust::reduce(contig, contig + rg.chunks.size(), num_extra_pages);
+      }
+    }
+  }
+
   // Association between each column chunk and its source
   std::vector<size_type> chunk_source_map(num_chunks);
 
   // Tracker for eventually deallocating compressed and uncompressed data
-  raw_page_data = std::vector<std::unique_ptr<datasource::buffer>>(num_chunks);
+  raw_page_data = std::vector<std::unique_ptr<datasource::buffer>>(num_chunks + num_extra_pages);
 
   // Keep track of column chunk file offsets
-  std::vector<size_t> column_chunk_offsets(num_chunks);
+  std::vector<size_t> column_chunk_offsets(num_chunks + num_extra_pages);
+
+  // if there are lists present, we need to preprocess
+  bool has_lists = false;
 
   // Initialize column chunk information
   size_t total_decompressed_size = 0;
   auto remaining_rows            = num_rows;
+  size_t chunk_idx               = 0;
   std::vector<std::future<void>> read_rowgroup_tasks;
-  for (const auto& rg : row_groups_info) {
-    const auto& row_group       = _metadata->get_row_group(rg.index, rg.source_index);
+  for (size_t rg_idx = 0; rg_idx < row_groups_info.size(); rg_idx++) {
+    auto const& rg              = row_groups_info[rg_idx];
+    auto const& row_group       = _metadata->get_row_group(rg.index, rg.source_index);
     auto const row_group_start  = rg.start_row;
     auto const row_group_source = rg.source_index;
     auto const row_group_rows   = std::min<int>(remaining_rows, row_group.num_rows);
     auto const io_chunk_idx     = chunks.size();
+    auto const start_chunk_idx  = chunk_idx;
 
     // generate ColumnChunkDesc objects for everything to be decoded (all input columns)
     for (size_t i = 0; i < num_input_columns; ++i) {
-      auto col = _input_columns[i];
+      size_t first_page_row = 0;
+      auto col              = _input_columns[i];
       // look up metadata
-      auto& col_meta = _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
-      auto& schema   = _metadata->get_schema(col.schema_idx);
+      auto const& col_meta =
+        _metadata->get_column_metadata(rg.index, rg.source_index, col.schema_idx);
+      auto const& schema = _metadata->get_schema(col.schema_idx);
+
+      // this column contains repetition levels and will require a preprocess
+      if (schema.max_repetition_level > 0) { has_lists = true; }
 
       auto [type_width, clock_rate, converted_type] =
         conversion_info(to_type_id(schema, _strings_to_categorical, _timestamp_type.id()),
@@ -692,17 +787,58 @@ void reader::impl::load_and_decompress_data(std::vector<row_group_info> const& r
                         schema.converted_type,
                         schema.type_length);
 
-      column_chunk_offsets[chunks.size()] =
-        (col_meta.dictionary_page_offset != 0)
-          ? std::min(col_meta.data_page_offset, col_meta.dictionary_page_offset)
-          : col_meta.data_page_offset;
+      size_type compressed_size;
+      size_type dict_size;
 
-      chunks.push_back(gpu::ColumnChunkDesc(col_meta.total_compressed_size,
+      // translate schema_idx into something we can use for the page indexes
+      size_type colidx = 0;
+      for (auto const& colchunk : _metadata->get_row_group(rg.index, rg.source_index).columns) {
+        if (colchunk.schema_idx == col.schema_idx) { break; }
+        colidx++;
+      }
+
+      if (uses_custom_row_bounds && rg.has_page_index()) {
+        auto const& col_info = rg.chunks[colidx];
+        if (col_info.pages.size() == 0) {
+          dict_size       = 0;
+          compressed_size = 0;
+        } else {
+          auto size_input = thrust::make_transform_iterator(
+            col_info.pages.begin(),
+            [](page_info const& page) { return page.location.compressed_page_size; });
+          compressed_size = thrust::reduce(size_input, size_input + col_info.pages.size());
+          if (col_info.dictionary_offset > 0 && not col_info.is_contiguous()) {
+            column_chunk_offsets[chunk_idx++] = col_info.dictionary_offset;
+            dict_size                         = col_info.dictionary_size;
+            column_chunk_offsets[chunk_idx]   = col_info.pages[0].location.offset;
+          } else {
+            dict_size = 0;
+            compressed_size += col_info.dictionary_size;
+            column_chunk_offsets[chunk_idx] = col_info.dictionary_offset > 0
+                                                ? col_info.dictionary_offset
+                                                : col_info.pages[0].location.offset;
+          }
+
+          first_page_row = col_info.pages[0].location.first_row_index;
+        }
+      } else {
+        dict_size       = 0;
+        compressed_size = col_meta.total_compressed_size;
+        column_chunk_offsets[chunks.size()] =
+          col_meta.dictionary_page_offset > 0
+            ? std::min(col_meta.data_page_offset, col_meta.dictionary_page_offset)
+            : col_meta.data_page_offset;
+      }
+
+      chunks.push_back(gpu::ColumnChunkDesc(dict_size,
+                                            nullptr,
+                                            compressed_size,
                                             nullptr,
                                             col_meta.num_values,
                                             schema.type,
                                             type_width,
                                             row_group_start,
+                                            first_page_row,
                                             row_group_rows,
                                             schema.max_definition_level,
                                             schema.max_repetition_level,
@@ -715,14 +851,19 @@ void reader::impl::load_and_decompress_data(std::vector<row_group_info> const& r
                                             schema.decimal_precision,
                                             clock_rate,
                                             i,
-                                            col.schema_idx));
+                                            col.schema_idx,
+                                            rg_idx,
+                                            colidx));
 
       // Map each column chunk to its column index and its source index
       chunk_source_map[chunks.size() - 1] = row_group_source;
 
       if (col_meta.codec != Compression::UNCOMPRESSED) {
+        // doesn't need to be exact, just used to indicate the presence of compressed pages
         total_decompressed_size += col_meta.total_uncompressed_size;
       }
+
+      chunk_idx++;
     }
     // Read compressed chunk data to device memory
     read_rowgroup_tasks.push_back(read_column_chunks_async(_sources,
@@ -732,6 +873,7 @@ void reader::impl::load_and_decompress_data(std::vector<row_group_info> const& r
                                                            chunks.size(),
                                                            column_chunk_offsets,
                                                            chunk_source_map,
+                                                           start_chunk_idx,
                                                            _stream));
 
     remaining_rows -= row_group.num_rows;
@@ -743,19 +885,34 @@ void reader::impl::load_and_decompress_data(std::vector<row_group_info> const& r
   CUDF_EXPECTS(remaining_rows <= 0, "All rows data must be read.");
 
   // Process dataset chunk pages into output columns
-  auto const total_pages = count_page_headers(chunks, _stream);
-  pages_info             = hostdevice_vector<gpu::PageInfo>(total_pages, total_pages, _stream);
+  // this pass just calculates num_data_pages and num_dict_pages.  can
+  // figure this out from metadata if we have page indexes
+  const auto total_pages = _metadata->has_page_index()
+                             ? count_page_headers_with_pgidx(chunks, row_groups_info)
+                             : count_page_headers(chunks, _stream);
+
+  pages_info = hostdevice_vector<gpu::PageInfo>(total_pages, total_pages, _stream);
 
   if (total_pages > 0) {
     // decoding of column/page information
     decode_page_headers(chunks, pages_info, _stream);
+    if (has_lists && _metadata->has_page_index()) {
+      fill_in_page_info(chunks, pages_info, row_groups_info);
+      pages_info.host_to_device(_stream, true);
+    }
+
     if (total_decompressed_size > 0) {
       decomp_page_data = decompress_page_data(chunks, pages_info, _stream);
       // Free compressed data
-      for (size_t c = 0; c < chunks.size(); c++) {
+      for (size_t c = 0, p = 0; c < chunks.size(); c++) {
+        // need to check for discontiguous page dictionaries
         if (chunks[c].codec != parquet::Compression::UNCOMPRESSED) {
-          raw_page_data[c].reset();
           // TODO: Check if this is called
+          raw_page_data[p++].reset();
+          // if chunk is not contiguous then get rid of extra page_data entry
+          if (chunks[c].dictionary_size > 0) { raw_page_data[p++].reset(); }
+        } else {
+          p += chunks[c].dictionary_size > 0 ? 2 : 1;
         }
       }
     }
@@ -1356,6 +1513,7 @@ void detect_malformed_pages(hostdevice_vector<gpu::PageInfo>& pages,
 void reader::impl::preprocess_pages(size_t skip_rows,
                                     size_t num_rows,
                                     bool uses_custom_row_bounds,
+                                    bool has_page_index,
                                     size_t chunk_read_limit)
 {
   auto& chunks = _file_itm_data.chunks;
@@ -1403,12 +1561,15 @@ void reader::impl::preprocess_pages(size_t skip_rows,
   //   is possible to load this by just capping the number of rows read, we cannot tell
   //   which rows are invalid so we may be returning bad data. in addition, this mismatch
   //   confuses the chunked reader
-  detect_malformed_pages(pages,
-                         chunks,
-                         page_keys,
-                         page_index,
-                         uses_custom_row_bounds ? std::nullopt : std::make_optional(num_rows),
-                         _stream);
+  // FIXME(ets): this fails when using column index to skip pages
+  if (!uses_custom_row_bounds) {
+    detect_malformed_pages(pages,
+                           chunks,
+                           page_keys,
+                           page_index,
+                           uses_custom_row_bounds ? std::nullopt : std::make_optional(num_rows),
+                           _stream);
+  }
 
   // iterate over all input columns and determine if they contain lists so we can further
   // preprocess them.
@@ -1495,15 +1656,19 @@ void reader::impl::preprocess_pages(size_t skip_rows,
 
     // computes:
     // PageInfo::chunk_row (the absolute start row index) for all pages
-    // Note: this is doing some redundant work for pages in flat hierarchies.  chunk_row has already
-    // been computed during header decoding. the overall amount of work here is very small though.
-    auto key_input  = thrust::make_transform_iterator(pages.device_ptr(), get_page_chunk_idx{});
-    auto page_input = thrust::make_transform_iterator(pages.device_ptr(), get_page_num_rows{});
-    thrust::exclusive_scan_by_key(rmm::exec_policy(_stream),
-                                  key_input,
-                                  key_input + pages.size(),
-                                  page_input,
-                                  chunk_row_output_iter{pages.device_ptr()});
+    // if page statistics are present these will be precomputed
+    if (not has_page_index) {
+      // Note: this is doing some redundant work for pages in flat hierarchies.  chunk_row has
+      // already been computed during header decoding. the overall amount of work here is very small
+      // though.
+      auto key_input  = thrust::make_transform_iterator(pages.device_ptr(), get_page_chunk_idx{});
+      auto page_input = thrust::make_transform_iterator(pages.device_ptr(), get_page_num_rows{});
+      thrust::exclusive_scan_by_key(rmm::exec_policy(_stream),
+                                    key_input,
+                                    key_input + pages.size(),
+                                    page_input,
+                                    chunk_row_output_iter{pages.device_ptr()});
+    }
 
     // preserve page ordering data
     _chunk_itm_data.page_keys  = std::move(page_keys);

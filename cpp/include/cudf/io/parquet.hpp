@@ -465,7 +465,8 @@ class parquet_writer_options {
   // Specify the compression format to use
   compression_type _compression = compression_type::SNAPPY;
   // Specify the level of statistics in the output file
-  statistics_freq _stats_level = statistics_freq::STATISTICS_ROWGROUP;
+  // FIXME(ets): change back to STATISTICS_ROWGROUP before merge
+  statistics_freq _stats_level = statistics_freq::STATISTICS_COLUMN;
   // Sets of columns to output
   table_view _table;
   // Partitions described as {start_row, num_rows} pairs
@@ -1053,7 +1054,8 @@ class chunked_parquet_writer_options {
   // Specify the compression format to use
   compression_type _compression = compression_type::AUTO;
   // Specify the level of statistics in the output file
-  statistics_freq _stats_level = statistics_freq::STATISTICS_ROWGROUP;
+  // FIXME(ets): change back to STATISTICS_ROWGROUP before merge
+  statistics_freq _stats_level = statistics_freq::STATISTICS_COLUMN;
   // Optional associated metadata.
   table_input_metadata const* _metadata = nullptr;
   // Optional footer key_value_metadata

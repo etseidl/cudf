@@ -191,8 +191,17 @@ metadata::metadata(datasource* source)
 
   const auto buffer = source->host_read(len - ender->footer_len - ender_len, ender->footer_len);
   CompactProtocolReader cp(buffer->data(), ender->footer_len);
-  CUDF_EXPECTS(cp.read(this), "Cannot parse metadata");
-  CUDF_EXPECTS(cp.InitSchema(this), "Cannot initialize schema");
+  bool res = cp.read(this);
+  CUDF_EXPECTS(res, "Cannot parse metadata");
+  res = cp.InitSchema(this);
+  CUDF_EXPECTS(res, "Cannot initialize schema");
+}
+
+bool metadata::has_page_index() const
+{
+  if (row_groups.size() == 0 or row_groups[0].columns.size() == 0) { return false; }
+  auto const& col0 = row_groups[0].columns[0];
+  return col0.column_index_offset > 0 && col0.offset_index_offset > 0;
 }
 
 std::vector<metadata> aggregate_reader_metadata::metadatas_from_sources(
@@ -243,6 +252,83 @@ size_type aggregate_reader_metadata::calc_num_row_groups() const
     });
 }
 
+void aggregate_reader_metadata::column_info_for_row_group(row_group_info& rgi,
+                                                          std::unique_ptr<datasource> const& source,
+                                                          size_type chunk_start_row,
+                                                          size_type row_start,
+                                                          size_type row_count) const
+{
+  auto const& fmd = per_file_metadata[rgi.source_index];
+  auto const& rg  = fmd.row_groups[rgi.index];
+  rgi.chunks.resize(rg.columns.size());
+
+  // find column and offset indexes in file
+  size_t ci_offset = rg.columns[0].column_index_offset;
+  auto ci_lengths  = thrust::make_transform_iterator(
+    rg.columns.begin(), [](auto const& column) { return column.column_index_length; });
+  size_t ci_length  = thrust::reduce(ci_lengths, ci_lengths + rg.columns.size());
+  auto const ci_buf = source->host_read(ci_offset, ci_length);
+  CompactProtocolReader cp_ci(ci_buf->data(), ci_buf->size());
+
+  size_t oi_offset = rg.columns[0].offset_index_offset;
+  auto oi_lengths  = thrust::make_transform_iterator(
+    rg.columns.begin(), [](auto const& column) { return column.offset_index_length; });
+  size_t oi_length  = thrust::reduce(oi_lengths, oi_lengths + rg.columns.size());
+  auto const oi_buf = source->host_read(oi_offset, oi_length);
+  CompactProtocolReader cp_oi(oi_buf->data(), oi_buf->size());
+
+  // now fill in column info for pages that intersect the range
+  // [row_start, row_start + row_count)
+  for (size_t col_idx = 0; col_idx < rg.columns.size(); col_idx++) {
+    ColumnIndex colidx;
+    bool res = cp_ci.read(&colidx);
+    CUDF_EXPECTS(res, "Cannot parse column index");
+
+    OffsetIndex offidx;
+    res = cp_oi.read(&offidx);
+    CUDF_EXPECTS(res, "Cannot parse offset index");
+
+    auto const& chunk    = rg.columns[col_idx];
+    auto& chunk_info     = rgi.chunks[col_idx];
+    auto const num_pages = offidx.page_locations.size();
+
+    // bug in parquet-mr does not write dictionary offsets, so check to
+    // see if data_page_offset differs from first entry in offsets index
+    if (chunk.meta_data.dictionary_page_offset > 0) {
+      chunk_info.dictionary_offset = chunk.meta_data.dictionary_page_offset;
+      chunk_info.dictionary_size = chunk.meta_data.data_page_offset - chunk_info.dictionary_offset;
+    } else {
+      if (num_pages > 0 && chunk.meta_data.data_page_offset < offidx.page_locations[0].offset) {
+        chunk_info.dictionary_offset = chunk.meta_data.data_page_offset;
+        chunk_info.dictionary_size =
+          offidx.page_locations[0].offset - chunk.meta_data.data_page_offset;
+      } else {
+        chunk_info.dictionary_offset = 0;
+        chunk_info.dictionary_size   = 0;
+      }
+    }
+
+    auto range_matches = [row_start, row_end = row_start + row_count](size_type pg_start,
+                                                                      size_type pg_end) {
+      return row_start < pg_end && row_end > pg_start;
+    };
+
+    for (size_t pg_idx = 0; pg_idx < num_pages; pg_idx++) {
+      auto const& page_loc = offidx.page_locations[pg_idx];
+      // translate chunk-relative row nums to absolute within the file
+      auto const pg_start_row = chunk_start_row + page_loc.first_row_index;
+      auto const pg_end_row =
+        chunk_start_row + (pg_idx == (num_pages - 1)
+                             ? rg.num_rows
+                             : offidx.page_locations[pg_idx + 1].first_row_index);
+      if (range_matches(pg_start_row, pg_end_row)) {
+        chunk_info.pages.push_back(
+          page_info{page_loc, pg_end_row - pg_start_row, colidx.null_counts[pg_idx]});
+      }
+    }
+  }
+}
+
 aggregate_reader_metadata::aggregate_reader_metadata(
   std::vector<std::unique_ptr<datasource>> const& sources)
   : per_file_metadata(metadatas_from_sources(sources)),
@@ -265,6 +351,13 @@ aggregate_reader_metadata::aggregate_reader_metadata(
       CUDF_EXPECTS(schema == pfm.schema, "All sources must have the same schema");
     }
   }
+}
+
+bool aggregate_reader_metadata::has_page_index() const
+{
+  return std::all_of(per_file_metadata.begin(), per_file_metadata.end(), [](metadata const& meta) {
+    return meta.has_page_index();
+  });
 }
 
 RowGroup const& aggregate_reader_metadata::get_row_group(size_type row_group_index,
@@ -338,6 +431,7 @@ std::vector<std::string> aggregate_reader_metadata::get_pandas_index_names() con
 
 std::tuple<size_type, size_type, std::vector<row_group_info>>
 aggregate_reader_metadata::select_row_groups(
+  std::vector<std::unique_ptr<datasource>> const& sources,
   host_span<std::vector<size_type> const> row_group_indices,
   size_type row_start,
   size_type row_count) const
@@ -350,12 +444,20 @@ aggregate_reader_metadata::select_row_groups(
 
     row_count = 0;
     for (size_t src_idx = 0; src_idx < row_group_indices.size(); ++src_idx) {
+      auto const& fmd = per_file_metadata[src_idx];
       for (auto const& rowgroup_idx : row_group_indices[src_idx]) {
         CUDF_EXPECTS(
-          rowgroup_idx >= 0 &&
-            rowgroup_idx < static_cast<size_type>(per_file_metadata[src_idx].row_groups.size()),
+          rowgroup_idx >= 0 && rowgroup_idx < static_cast<size_type>(fmd.row_groups.size()),
           "Invalid rowgroup index");
-        selection.emplace_back(rowgroup_idx, row_count, src_idx);
+        row_group_info rgi(rowgroup_idx, row_count, src_idx);
+        // if page-level indexes are present, then collect extra chunk and page info.
+        if (fmd.has_page_index()) {
+          // FIXME(ets): is this true?
+          // range counting is invalid when picking row groups, so just set bounds
+          // to [0, infinity)
+          column_info_for_row_group(rgi, sources[src_idx], 0, 0, std::numeric_limits<size_type>::max());
+        }
+        selection.emplace_back(rgi);
         row_count += get_row_group(rowgroup_idx, src_idx).num_rows;
       }
     }
@@ -373,11 +475,21 @@ aggregate_reader_metadata::select_row_groups(
 
   size_type count = 0;
   for (size_t src_idx = 0; src_idx < per_file_metadata.size(); ++src_idx) {
-    for (size_t rg_idx = 0; rg_idx < per_file_metadata[src_idx].row_groups.size(); ++rg_idx) {
+    auto const& fmd = per_file_metadata[src_idx];
+
+    for (size_t rg_idx = 0; rg_idx < fmd.row_groups.size(); ++rg_idx) {
+      auto const& rg             = fmd.row_groups[rg_idx];
       auto const chunk_start_row = count;
-      count += get_row_group(rg_idx, src_idx).num_rows;
+      count += rg.num_rows;
       if (count > row_start || count == 0) {
-        selection.emplace_back(rg_idx, chunk_start_row, src_idx);
+        row_group_info rgi(rg_idx, chunk_start_row, src_idx);
+
+        // if page-level indexes are present, then collect extra chunk and page
+        // info. if using custom bounds, then figure out which pages to read
+        if (fmd.has_page_index()) {
+          column_info_for_row_group(rgi, sources[src_idx], chunk_start_row, row_start, row_count);
+        }
+        selection.emplace_back(rgi);
       }
       if (count >= row_start + row_count) { break; }
     }

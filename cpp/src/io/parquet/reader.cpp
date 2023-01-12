@@ -33,6 +33,7 @@ reader::~reader() = default;
 table_with_metadata reader::read(parquet_reader_options const& options)
 {
   // if the user has specified custom row bounds
+  // FIXME(ets): should we enforce get_row_groups() is empty if using custom row bounds?
   bool const uses_custom_row_bounds = options.get_num_rows() >= 0 || options.get_skip_rows() != 0;
   return _impl->read(options.get_skip_rows(),
                      options.get_num_rows(),
