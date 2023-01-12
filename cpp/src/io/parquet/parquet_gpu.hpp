@@ -180,12 +180,15 @@ struct PageInfo {
  */
 struct ColumnChunkDesc {
   ColumnChunkDesc() = default;
-  explicit ColumnChunkDesc(size_t compressed_size_,
+  explicit ColumnChunkDesc(size_t dictionary_size_,
+                           uint8_t* dictionary_data_,
+                           size_t compressed_size_,
                            uint8_t* compressed_data_,
                            size_t num_values_,
                            uint16_t datatype_,
                            uint16_t datatype_length_,
                            size_t start_row_,
+                           size_t first_page_row_,
                            uint32_t num_rows_,
                            int16_t max_definition_level_,
                            int16_t max_repetition_level_,
@@ -198,11 +201,16 @@ struct ColumnChunkDesc {
                            int8_t decimal_precision_,
                            int32_t ts_clock_rate_,
                            int32_t src_col_index_,
-                           int32_t src_col_schema_)
-    : compressed_data(compressed_data_),
+                           int32_t src_col_schema_,
+                           size_type row_group_idx_,
+                           size_type pgidx_col_idx_)
+    : dictionary_size(dictionary_size_),
+      dictionary_data(dictionary_data_),
+      compressed_data(compressed_data_),
       compressed_size(compressed_size_),
       num_values(num_values_),
       start_row(start_row_),
+      first_page_row(first_page_row_),
       num_rows(num_rows_),
       max_level{max_definition_level_, max_repetition_level_},
       max_nesting_depth{max_nesting_depth_},
@@ -221,14 +229,24 @@ struct ColumnChunkDesc {
       decimal_precision(decimal_precision_),
       ts_clock_rate(ts_clock_rate_),
       src_col_index(src_col_index_),
-      src_col_schema(src_col_schema_)
+      src_col_schema(src_col_schema_),
+      row_group_idx(row_group_idx_),
+      pgidx_col_idx(pgidx_col_idx_)
   {
   }
 
+  // dictionary fields will only be set when the dictionary is not contiguous with the
+  // the page data (i.e. when skipping data pages)
+  size_t dictionary_size;                          // dictionary size for this chunk
+  uint8_t const* dictionary_data;                  // pointer to dictionary for this chunk
   uint8_t const* compressed_data;                  // pointer to compressed column chunk data
   size_t compressed_size;                          // total compressed data size for this chunk
   size_t num_values;                               // total number of values in this column
-  size_t start_row;                                // starting row of this chunk
+  size_t start_row;                                // starting row of this chunk relative to start
+                                                   // of file
+  size_t first_page_row;                           // row index of first page read in this chunk
+                                                   // relative to start of chunk. 0 unless skipping
+                                                   // pages
   uint32_t num_rows;                               // number of rows in this chunk
   int16_t max_level[level_type::NUM_LEVEL_TYPES];  // max definition/repetition level
   int16_t max_nesting_depth;                       // max nesting depth of the output
@@ -250,8 +268,10 @@ struct ColumnChunkDesc {
   int8_t decimal_precision;                   // Decimal precision
   int32_t ts_clock_rate;  // output timestamp clock frequency (0=default, 1000=ms, 1000000000=ns)
 
-  int32_t src_col_index;   // my input column index
-  int32_t src_col_schema;  // my schema index in the file
+  int32_t src_col_index;    // my input column index
+  int32_t src_col_schema;   // my schema index in the file
+  size_type row_group_idx;  // index of the row_group_info for this chunk
+  size_type pgidx_col_idx;  // index of this column in page stats, -1 if no stats
 };
 
 /**

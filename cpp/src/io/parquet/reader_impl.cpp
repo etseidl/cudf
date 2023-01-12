@@ -242,12 +242,15 @@ void reader::impl::prepare_data(size_type skip_rows,
   if (_file_preprocessed) { return; }
 
   const auto [skip_rows_corrected, num_rows_corrected, row_groups_info] =
-    _metadata->select_row_groups(row_group_indices, skip_rows, num_rows);
+    _metadata->select_row_groups(_sources, row_group_indices, skip_rows, num_rows);
 
   if (num_rows_corrected > 0 && row_groups_info.size() != 0 && _input_columns.size() != 0) {
-    load_and_decompress_data(row_groups_info, num_rows_corrected);
-    preprocess_pages(
-      skip_rows_corrected, num_rows_corrected, uses_custom_row_bounds, _chunk_read_limit);
+    load_and_decompress_data(row_groups_info, num_rows_corrected, uses_custom_row_bounds);
+    preprocess_pages(skip_rows_corrected,
+                     num_rows_corrected,
+                     uses_custom_row_bounds,
+                     _metadata->has_page_index(),
+                     _chunk_read_limit);
 
     if (_chunk_read_limit == 0) {  // read the whole file at once
       CUDF_EXPECTS(_chunk_read_info.size() == 1,

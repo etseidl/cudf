@@ -134,7 +134,8 @@ class reader::impl {
    * @brief Load and decompress the input file(s) into memory.
    */
   void load_and_decompress_data(std::vector<row_group_info> const& row_groups_info,
-                                size_type num_rows);
+                                size_type num_rows,
+                                bool uses_custom_row_bounds);
 
   /**
    * @brief Perform some preprocessing for page data and also compute the split locations
@@ -151,12 +152,14 @@ class reader::impl {
    * @param num_rows Maximum number of rows to read
    * @param uses_custom_row_bounds Whether or not num_rows and skip_rows represents user-specific
    *        bounds
+   * @param has_page_index True if page indexes are available
    * @param chunk_read_limit Limit on total number of bytes to be returned per read,
    *        or `0` if there is no limit
    */
   void preprocess_pages(size_t skip_rows,
                         size_t num_rows,
                         bool uses_custom_row_bounds,
+                        bool has_page_index,
                         size_t chunk_read_limit);
 
   /**

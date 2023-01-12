@@ -48,16 +48,42 @@ using namespace cudf::io::parquet;
 }
 
 /**
+ * @brief page location and size info
+ */
+struct page_info {
+  PageLocation location;
+  int64_t num_rows;
+  int64_t num_nulls;
+};
+
+/**
+ * @brief column chunk metadata
+ */
+struct column_info {
+  int64_t dictionary_offset;
+  int32_t dictionary_size;
+  std::vector<page_info> pages;
+
+  constexpr bool is_contiguous() const
+  {
+    return !dictionary_offset || dictionary_offset + dictionary_size == pages[0].location.offset;
+  }
+};
+
+/**
  * @brief The row_group_info class
  */
 struct row_group_info {
   size_type const index;
   size_t const start_row;  // TODO source index
   size_type const source_index;
+  std::vector<column_info> chunks;
   row_group_info(size_type index, size_t start_row, size_type source_index)
     : index(index), start_row(start_row), source_index(source_index)
   {
   }
+
+  [[nodiscard]] bool has_page_index() const { return chunks.size() > 0; }
 };
 
 /**
@@ -65,6 +91,8 @@ struct row_group_info {
  */
 struct metadata : public FileMetaData {
   explicit metadata(datasource* source);
+
+  bool has_page_index() const;
 };
 
 class aggregate_reader_metadata {
@@ -95,8 +123,19 @@ class aggregate_reader_metadata {
    */
   [[nodiscard]] size_type calc_num_row_groups() const;
 
+  /**
+   * @brief Calculate column index info for given row_group_info
+   */
+  void column_info_for_row_group(row_group_info& rgi,
+                                 std::unique_ptr<datasource> const& source,
+                                 size_type chunk_start_row,
+                                 size_type row_start,
+                                 size_type row_count) const;
+
  public:
   aggregate_reader_metadata(std::vector<std::unique_ptr<datasource>> const& sources);
+
+  [[nodiscard]] bool has_page_index() const;
 
   [[nodiscard]] RowGroup const& get_row_group(size_type row_group_index, size_type src_idx) const;
 
@@ -170,6 +209,7 @@ class aggregate_reader_metadata {
    *         starting row
    */
   [[nodiscard]] std::tuple<size_type, size_type, std::vector<row_group_info>> select_row_groups(
+    std::vector<std::unique_ptr<datasource>> const& sources,
     host_span<std::vector<size_type> const> row_group_indices,
     size_type row_start,
     size_type row_count) const;
