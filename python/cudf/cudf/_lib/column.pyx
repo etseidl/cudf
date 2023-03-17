@@ -1,5 +1,6 @@
 # Copyright (c) 2020-2023, NVIDIA CORPORATION.
 
+
 import cupy as cp
 import numpy as np
 
@@ -10,6 +11,7 @@ import cudf._lib as libcudf
 from cudf.api.types import is_categorical_dtype
 from cudf.core.buffer import (
     Buffer,
+    CopyOnWriteBuffer,
     SpillableBuffer,
     acquire_spill_lock,
     as_buffer,
@@ -101,7 +103,7 @@ cdef class Column:
         if self.data is None:
             return 0
         else:
-            return self.data.ptr
+            return self.data.get_ptr(mode="write")
 
     def set_base_data(self, value):
         if value is not None and not isinstance(value, Buffer):
@@ -125,13 +127,6 @@ cdef class Column:
         return self._base_mask
 
     @property
-    def base_mask_ptr(self):
-        if self.base_mask is None:
-            return 0
-        else:
-            return self.base_mask.ptr
-
-    @property
     def mask(self):
         if self._mask is None:
             if self.base_mask is None or self.offset == 0:
@@ -145,7 +140,7 @@ cdef class Column:
         if self.mask is None:
             return 0
         else:
-            return self.mask.ptr
+            return self.mask.get_ptr(mode="write")
 
     def set_base_mask(self, value):
         """
@@ -206,7 +201,7 @@ cdef class Column:
         elif hasattr(value, "__cuda_array_interface__"):
             if value.__cuda_array_interface__["typestr"] not in ("|i1", "|u1"):
                 if isinstance(value, Column):
-                    value = value.data_array_view
+                    value = value.data_array_view(mode="write")
                 value = cp.asarray(value).view('|u1')
             mask = as_buffer(value)
             if mask.size < required_num_bytes:
@@ -329,10 +324,10 @@ cdef class Column:
 
         if col.base_data is None:
             data = NULL
-        elif isinstance(col.base_data, SpillableBuffer):
-            data = <void*><uintptr_t>(col.base_data).get_ptr()
         else:
-            data = <void*><uintptr_t>(col.base_data.ptr)
+            data = <void*><uintptr_t>(col.base_data.get_ptr(
+                mode="write")
+            )
 
         cdef Column child_column
         if col.base_children:
@@ -341,7 +336,9 @@ cdef class Column:
 
         cdef libcudf_types.bitmask_type* mask
         if self.nullable:
-            mask = <libcudf_types.bitmask_type*><uintptr_t>(self.base_mask_ptr)
+            mask = <libcudf_types.bitmask_type*><uintptr_t>(
+                self.base_mask.get_ptr(mode="write")
+            )
         else:
             mask = NULL
 
@@ -387,10 +384,8 @@ cdef class Column:
 
         if col.base_data is None:
             data = NULL
-        elif isinstance(col.base_data, SpillableBuffer):
-            data = <void*><uintptr_t>(col.base_data).get_ptr()
         else:
-            data = <void*><uintptr_t>(col.base_data.ptr)
+            data = <void*><uintptr_t>(col.base_data.get_ptr(mode="read"))
 
         cdef Column child_column
         if col.base_children:
@@ -399,7 +394,9 @@ cdef class Column:
 
         cdef libcudf_types.bitmask_type* mask
         if self.nullable:
-            mask = <libcudf_types.bitmask_type*><uintptr_t>(self.base_mask_ptr)
+            mask = <libcudf_types.bitmask_type*><uintptr_t>(
+                self.base_mask.get_ptr(mode="read")
+            )
         else:
             mask = NULL
 
@@ -520,6 +517,13 @@ cdef class Column:
                     rmm.DeviceBuffer(ptr=data_ptr,
                                      size=(size+offset) * dtype_itemsize)
                 )
+            elif column_owner and isinstance(data_owner, CopyOnWriteBuffer):
+                # TODO: In future, see if we can just pass on the
+                # CopyOnWriteBuffer reference to another column
+                # and still create a weak reference.
+                # With the current design that's not possible.
+                # https://github.com/rapidsai/cudf/issues/12734
+                data = data_owner.copy(deep=False)
             elif (
                 # This is an optimization of the most common case where
                 # from_column_view creates a "view" that is identical to
@@ -543,13 +547,17 @@ cdef class Column:
                     owner=data_owner,
                     exposed=True,
                 )
-                if isinstance(data_owner, SpillableBuffer):
+                if isinstance(data_owner, CopyOnWriteBuffer):
+                    data_owner.get_ptr(mode="write")
+                    # accessing the pointer marks it exposed.
+                elif isinstance(data_owner, SpillableBuffer):
                     if data_owner.is_spilled:
                         raise ValueError(
                             f"{data_owner} is spilled, which invalidates "
                             f"the exposed data_ptr ({hex(data_ptr)})"
                         )
-                    data_owner.ptr  # accessing the pointer marks it exposed.
+                    # accessing the pointer marks it exposed permanently.
+                    data_owner.mark_exposed()
         else:
             data = as_buffer(
                 rmm.DeviceBuffer(ptr=data_ptr, size=0)

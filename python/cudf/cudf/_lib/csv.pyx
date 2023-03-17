@@ -425,7 +425,7 @@ def read_csv(
     with nogil:
         c_result = move(cpp_read_csv(read_csv_options_c))
 
-    meta_names = [name.decode() for name in c_result.metadata.column_names]
+    meta_names = [info.name.decode() for info in c_result.metadata.schema_info]
     df = cudf.DataFrame._from_data(*data_from_unique_ptr(
         move(c_result.tbl),
         column_names=meta_names
@@ -472,7 +472,7 @@ def write_csv(
     object sep=",",
     object na_rep="",
     bool header=True,
-    object line_terminator="\n",
+    object lineterminator="\n",
     int rows_per_chunk=8,
     bool index=True,
 ):
@@ -488,7 +488,7 @@ def write_csv(
     )
     cdef bool include_header_c = header
     cdef char delim_c = ord(sep)
-    cdef string line_term_c = line_terminator.encode()
+    cdef string line_term_c = lineterminator.encode()
     cdef string na_c = na_rep.encode()
     cdef int rows_per_chunk_c = rows_per_chunk
     cdef vector[string] col_names
@@ -533,8 +533,14 @@ def write_csv(
         .build()
     )
 
-    with nogil:
-        cpp_write_csv(options)
+    try:
+        with nogil:
+            cpp_write_csv(options)
+    except OverflowError:
+        raise OverflowError(
+            f"Writing CSV file with chunksize={rows_per_chunk} failed. "
+            "Consider providing a smaller chunksize argument."
+        )
 
 
 cdef data_type _get_cudf_data_type_from_dtype(object dtype) except +:
