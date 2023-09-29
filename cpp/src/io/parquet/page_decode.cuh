@@ -410,6 +410,8 @@ inline __device__ int gpuDecodeRleBooleans(page_state_s volatile* s,
  * @brief Parses the length and position of strings and returns total length of all strings
  * processed
  *
+ * Called by one warp.
+ *
  * @param[in,out] s Page state input/output
  * @param[out] sb Page state buffer output
  * @param[in] target_pos Target output position
@@ -425,26 +427,56 @@ __device__ size_type gpuInitStringDescriptors(page_state_s volatile* s,
                                               int target_pos,
                                               int t)
 {
+  using cudf::detail::warp_size;
   int pos       = s->dict_pos;
   int total_len = 0;
+  int dict_size = s->dict_size;
+  int k         = s->dict_val;
+
+  // if the data is fixed length, then we can do this in parallel
+  bool const is_flba = (s->col.data_type & 7) == FIXED_LEN_BYTE_ARRAY;
+
+  if (is_flba) {
+    using warp_reduce = cub::WarpReduce<int>;
+    __shared__ typename warp_reduce::TempStorage reduce_tmp;
+
+    while (pos < target_pos) {
+      int my_pos = pos + t;
+      if (my_pos < target_pos) {
+        int my_k = k + t * s->dtype_len_in;
+        int len  = my_k < dict_size ? s->dtype_len_in : 0;
+        if constexpr (!sizes_only) {
+          sb->dict_idx[rolling_index<state_buf::dict_buf_size>(my_pos)] = my_k;
+          sb->str_len[rolling_index<state_buf::str_buf_size>(my_pos)]   = s->dtype_len_in;
+        }
+        total_len += len;
+      }
+      pos += warp_size;
+      k += warp_size * s->dtype_len_in;
+    }
+
+    total_len = warp_reduce(reduce_tmp).Sum(total_len);
+    __syncwarp();
+    if (t == 0) {
+      s->dict_val += total_len;
+      __threadfence_block();
+    }
+
+    return total_len;
+  }
 
   // This step is purely serial
-  if (!t) {
+  if (t == 0) {
     uint8_t const* cur = s->data_start;
-    int dict_size      = s->dict_size;
-    int k              = s->dict_val;
 
     while (pos < target_pos) {
       int len = 0;
-      if ((s->col.data_type & 7) == FIXED_LEN_BYTE_ARRAY) {
-        if (k < dict_size) { len = s->dtype_len_in; }
-      } else {
-        if (k + 4 <= dict_size) {
-          len = (cur[k]) | (cur[k + 1] << 8) | (cur[k + 2] << 16) | (cur[k + 3] << 24);
-          k += 4;
-          if (k + len > dict_size) { len = 0; }
-        }
+      if (k + 4 <= dict_size) {
+        len = (cur[k]) | (cur[k + 1] << 8) | (cur[k + 2] << 16) | (cur[k + 3] << 24);
+        k += 4;
+        if (k + len > dict_size) { len = 0; }
       }
+
       if constexpr (!sizes_only) {
         sb->dict_idx[rolling_index<state_buf::dict_buf_size>(pos)] = k;
         sb->str_len[rolling_index<state_buf::str_buf_size>(pos)]   = len;
