@@ -1036,97 +1036,120 @@ __global__ void __launch_bounds__(block_size)
   int z                  = blockIdx.x;
   inflate_state_s* state = &state_g;
 
-  if (!t) {
-    auto p        = inputs[z].data();
-    auto src_size = inputs[z].size();
-    // Parse header if needed
-    state->err = 0;
-    if (parse_hdr == gzip_header_included::YES) {
-      int hdr_len = parse_gzip_header(p, src_size);
-      src_size    = (src_size >= 8) ? src_size - 8 : 0;  // ignore footer
-      if (hdr_len >= 0) {
-        p += hdr_len;
-        src_size -= hdr_len;
-      } else {
-        state->err = hdr_len;
-      }
-    }
+  auto member_start     = inputs[z].data();
+  auto const total_size = inputs[z].size();
+  size_t input_read     = 0;
+
+  if (t == 0) {
     // Initialize shared state
-    state->out              = outputs[z].data();
-    state->outbase          = state->out;
-    state->outend           = state->out + outputs[z].size();
-    state->end              = p + src_size;
-    auto const prefix_bytes = (uint32_t)(((size_t)p) & 3);
-    p -= prefix_bytes;
-    state->cur      = p;
-    state->bitbuf.x = (p < state->end) ? *reinterpret_cast<uint32_t const*>(p) : 0;
-    p += 4;
-    state->bitbuf.y = (p < state->end) ? *reinterpret_cast<uint32_t const*>(p) : 0;
-    state->bitpos   = prefix_bytes * 8;
+    state->out     = outputs[z].data();
+    state->outbase = state->out;
+    state->outend  = state->out + outputs[z].size();
+    state->end     = member_start + total_size;
+    state->cur     = member_start;
+    state->err     = 0;
   }
   __syncthreads();
-  // Main loop decoding blocks
-  while (!state->err) {
-    if (!t) {
-      // Thread0: read last flag, block type and custom huffman tables if any
-      if (state->cur + (state->bitpos >> 3) >= state->end)
-        state->err = 2;
-      else {
-        state->blast = getbits(state, 1);
-        state->btype = getbits(state, 2);
-        if (state->btype == 0)
-          state->err = init_stored(state);
-        else if (state->btype == 1)
-          state->err = init_fixed(state);
-        else if (state->btype == 2)
-          state->err = init_dynamic(state);
-        else
-          state->err = -1;  // Invalid block
-      }
-    }
-    __syncthreads();
-    if (!state->err && (state->btype == 1 || state->btype == 2)) {
-      // Initializes lookup tables (block wide)
-      init_length_lut(state, t);
-      init_distance_lut(state, t);
-#if ENABLE_PREFETCH
-      // Initialize prefetcher
-      init_prefetcher(state, t);
-#endif
-      if (t < batch_count) { state->x.batch_len[t] = 0; }
-      __syncthreads();
-      // decode data until end-of-block code
-      if (t < 1 * 32) {
-        // WARP0: decode variable-length symbols
-        if (!t) {
-          // Thread0: decode symbols (single threaded)
-          decode_symbols(state);
-#if ENABLE_PREFETCH
-          state->pref.run = 0;
-#endif
+
+  while (state->err == 0 and input_read < total_size) {
+    if (t == 0) {
+      auto p        = state->cur;
+      auto src_size = total_size - input_read;
+
+      // Parse header if needed
+      if (parse_hdr == gzip_header_included::YES) {
+        int hdr_len = parse_gzip_header(p, src_size);
+        src_size    = (src_size >= 8) ? src_size - 8 : 0;  // ignore footer
+        if (hdr_len >= 0) {
+          p += hdr_len;
+          src_size -= hdr_len;
+        } else {
+          state->err = hdr_len;
         }
-      } else if (t < 2 * 32) {
-        // WARP1: perform LZ77 using length and distance codes from WARP0
-        process_symbols(state, t & 0x1f);
       }
-#if ENABLE_PREFETCH
-      else if (t < 3 * 32) {
-        // WARP2: Prefetcher: prefetch data for WARP0
-        prefetch_warp(state, t & 0x1f);
-      }
-#endif
-      // else WARP3: idle
-    } else if (!state->err && state->btype == 0) {
-      // Uncompressed block (block-wide memcpy)
-      copy_stored(state, t);
+
+      auto const prefix_bytes = static_cast<uint32_t>(reinterpret_cast<size_t>(p) & 3);
+      p -= prefix_bytes;
+      state->cur      = p;
+      state->bitbuf.x = (p < state->end) ? *reinterpret_cast<uint32_t const*>(p) : 0;
+      p += 4;
+      state->bitbuf.y = (p < state->end) ? *reinterpret_cast<uint32_t const*>(p) : 0;
+      state->bitpos   = prefix_bytes * 8;
     }
-    if (state->blast) break;
+    __syncthreads();
+    // Main loop decoding blocks
+    while (!state->err) {
+      if (!t) {
+        // Thread0: read last flag, block type and custom huffman tables if any
+        if (state->cur + (state->bitpos >> 3) >= state->end)
+          state->err = 2;
+        else {
+          state->blast = getbits(state, 1);
+          state->btype = getbits(state, 2);
+          if (state->btype == 0)
+            state->err = init_stored(state);
+          else if (state->btype == 1)
+            state->err = init_fixed(state);
+          else if (state->btype == 2)
+            state->err = init_dynamic(state);
+          else
+            state->err = -1;  // Invalid block
+        }
+      }
+      __syncthreads();
+      if (!state->err && (state->btype == 1 || state->btype == 2)) {
+        // Initializes lookup tables (block wide)
+        init_length_lut(state, t);
+        init_distance_lut(state, t);
+#if ENABLE_PREFETCH
+        // Initialize prefetcher
+        init_prefetcher(state, t);
+#endif
+        if (t < batch_count) { state->x.batch_len[t] = 0; }
+        __syncthreads();
+        // decode data until end-of-block code
+        if (t < 1 * 32) {
+          // WARP0: decode variable-length symbols
+          if (!t) {
+            // Thread0: decode symbols (single threaded)
+            decode_symbols(state);
+#if ENABLE_PREFETCH
+            state->pref.run = 0;
+#endif
+          }
+        } else if (t < 2 * 32) {
+          // WARP1: perform LZ77 using length and distance codes from WARP0
+          process_symbols(state, t & 0x1f);
+        }
+#if ENABLE_PREFETCH
+        else if (t < 3 * 32) {
+          // WARP2: Prefetcher: prefetch data for WARP0
+          prefetch_warp(state, t & 0x1f);
+        }
+#endif
+        // else WARP3: idle
+      } else if (!state->err && state->btype == 0) {
+        // Uncompressed block (block-wide memcpy)
+        copy_stored(state, t);
+      }
+      if (state->blast) break;
+      __syncthreads();
+    }
+    __syncthreads();
+
+    auto pcur = state->cur + ((state->bitpos + 7) / 8);     // use round up safe div
+    if (parse_hdr == gzip_header_included::YES) pcur += 8;  // skip footer
+    input_read += pcur - member_start;
+    member_start = pcur;
+
+    // update state for next member
+    if (t == 0) { state->cur = member_start; }
     __syncthreads();
   }
-  __syncthreads();
+
   // Output decompression status and length
-  if (!t) {
-    if (state->err == 0 && state->cur + ((state->bitpos + 7) >> 3) > state->end) {
+  if (t == 0) {
+    if (state->err == 0 && state->cur > state->end) {
       // Read past the end of the input buffer
       state->err = 2;
     } else if (state->err == 0 && state->out > state->outend) {
