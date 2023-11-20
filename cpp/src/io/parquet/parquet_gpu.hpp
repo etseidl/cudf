@@ -424,8 +424,6 @@ struct parquet_column_device_view : stats_column_desc {
   constexpr uint8_t num_rep_level_bits() const { return level_bits >> 4; }
   uint8_t max_def_level;  //!< needed for SizeStatistics calculation
   uint8_t max_rep_level;
-  size_type const* const*
-    nesting_offsets;  //!< If column is a nested type, contains offset array of each nesting level
 
   size_type const* level_offsets;  //!< Offset array for per-row pre-calculated rep/def level values
   uint8_t const* rep_values;       //!< Pre-calculated repetition level values
@@ -448,6 +446,7 @@ struct PageFragment {
   uint32_t start_value_idx;
   uint32_t num_leaf_values;  //!< Number of leaf values in fragment. Does not include nulls at
                              //!< non-leaf level
+  uint32_t num_valid;        //<! Number of non-null leaf values
   size_type start_row;       //!< First row in fragment
   uint16_t num_rows;         //!< Number of rows in fragment
   uint16_t num_dict_vals;    //!< Number of unique dictionary entries
@@ -512,13 +511,12 @@ struct EncColumnChunk {
   size_type* dict_index;  //!< Index of value in dictionary page. column[dict_data[dict_index[row]]]
   uint8_t dict_rle_bits;  //!< Bit size for encoding dictionary indices
   bool use_dictionary;    //!< True if the chunk uses dictionary encoding
-  uint8_t* column_index_blob;  //!< Binary blob containing encoded column index for this chunk
-  uint32_t column_index_size;  //!< Size of column index blob
-  uint32_t encodings;          //!< Mask representing the set of encodings used for this chunk
-  // FIXME(ets): these should probably be uint64_t
-  uint32_t* def_histogram_data;  //!< buffers for size histograms. one for chunk and one per page.
-  uint32_t* rep_histogram_data;  //!< sized (max(level) + 1) * (num_data_pages + 1)
-  size_t var_bytes_size;         //!< sum of var_bytes_size from the pages (strings only)
+  uint8_t* column_index_blob;    //!< Binary blob containing encoded column index for this chunk
+  uint32_t column_index_size;    //!< Size of column index blob
+  uint32_t encodings;            //!< Mask representing the set of encodings used for this chunk
+  uint32_t* def_histogram_data;  //!< Buffers for size histograms. One for chunk and one per page.
+  uint32_t* rep_histogram_data;  //!< Size is (max(level) + 1) * (num_data_pages + 1).
+  size_t var_bytes_size;         //!< Sum of var_bytes_size from the pages (byte arrays only)
 };
 
 /**
@@ -545,12 +543,10 @@ struct EncPage {
   compression_result* comp_res;    //!< Ptr to compression result
   uint32_t num_nulls;              //!< Number of null values (V2 only) (down here for alignment)
   encode_kernel_mask kernel_mask;  //!< Mask used to control which encoding kernels to run
-  // additions for SizeStatistics
-  // FIXME(ets): these should probably be uint64_t
-  uint32_t* def_histogram;  //!< histogram of counts for each definition level
-  uint32_t* rep_histogram;  //!< histogram of counts for each repetition level
-  //!< histograms should be sized as max(level) + 1
-  uint32_t var_bytes_size;  //!< number of variable length bytes in the page (strings only)
+  uint32_t* def_histogram;         //!< Histogram of counts for each definition level
+  uint32_t* rep_histogram;         //!< Histogram of counts for each repetition level
+  uint32_t var_bytes_size;  //!< Number of variable length bytes in the page (byte arrays only)
+  uint32_t num_valid;       //!< Number of valid leaf values
 };
 
 /**

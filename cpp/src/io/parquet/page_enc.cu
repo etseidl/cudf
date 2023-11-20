@@ -180,13 +180,15 @@ void __device__ calculate_frag_size(frag_init_state_s* const s, int t)
   auto const nvals           = s->frag.num_leaf_values;
   auto const start_value_idx = s->frag.start_value_idx;
 
+  uint32_t num_valid = 0;
+  uint32_t len       = 0;
   for (uint32_t i = 0; i < nvals; i += block_size) {
     auto const val_idx  = start_value_idx + i + t;
     auto const is_valid = i + t < nvals && val_idx < s->col.leaf_column->size() &&
                           s->col.leaf_column->is_valid(val_idx);
-    uint32_t len;
     if (is_valid) {
-      len = dtype_len;
+      num_valid++;
+      len += dtype_len;
       if (physical_type == BYTE_ARRAY) {
         switch (leaf_type) {
           case type_id::STRING: {
@@ -201,17 +203,21 @@ void __device__ calculate_frag_size(frag_init_state_s* const s, int t)
           default: CUDF_UNREACHABLE("Unsupported data type for leaf column");
         }
       }
-    } else {
-      len = 0;
     }
+  }
+  __syncthreads();
+  auto const total_len   = block_reduce(reduce_storage).Sum(len);
+  auto const total_valid = block_reduce(reduce_storage).Sum(num_valid);
 
-    len = block_reduce(reduce_storage).Sum(len);
-    if (t == 0) { s->frag.fragment_data_size += len; }
-    __syncthreads();
-    // page fragment size must fit in a 32-bit signed integer
-    if (s->frag.fragment_data_size > std::numeric_limits<int32_t>::max()) {
-      CUDF_UNREACHABLE("page fragment size exceeds maximum for i32");
-    }
+  if (t == 0) {
+    s->frag.fragment_data_size = total_len;
+    s->frag.num_valid          = total_valid;
+  }
+
+  __syncthreads();
+  // page fragment size must fit in a 32-bit signed integer
+  if (s->frag.fragment_data_size > std::numeric_limits<int32_t>::max()) {
+    CUDF_UNREACHABLE("page fragment size exceeds maximum for i32");
   }
 }
 
@@ -241,25 +247,84 @@ Encoding __device__ determine_encoding(PageType page_type,
   }
 }
 
+/**
+ * @brief Generate level histogram for a page.
+ *
+ * For definition levels, the histogram values h(0)...h(max_def-1) represent nulls at
+ * various levels of the hierarchy, and h(max_def) is the number of non-null values (num_valid).
+ * If the leaf level is nullable, then num_leaf_values is h(max_def-1) + h(max_def),
+ * and h(max_def-1) is num_leaf_values - num_valid. h(0) is derivable as num_values -
+ * sum(h(1)..h(max_def)).
+ *
+ * For repetition levels, h(0) equals the number of rows. Here we can calculate
+ * h(1)..h(max_rep-1), set h(0) directly, and then obtain h(max_rep) in the same way as
+ * for the definition levels.
+ *
+ * @param hist Pointer to the histogram (size is max_level + 1)
+ * @param s Page encode state
+ * @param lvl_data Pointer to the global repetition or definition level data
+ * @param lvl_end Last element of the histogram to encode (exclusive)
+ */
+template <int block_size, typename state_buf>
+void __device__
+generate_page_histogram(uint32_t* hist, state_buf const* s, uint8_t const* lvl_data, int lvl_end)
+{
+  using block_reduce = cub::BlockReduce<int, block_size>;
+  __shared__ typename block_reduce::TempStorage temp_storage;
+
+  auto const t                  = threadIdx.x;
+  auto const page_first_val_idx = s->col.level_offsets[s->page.start_row];
+  auto const col_last_val_idx   = s->col.level_offsets[s->col.num_rows];
+
+  // h(0) is always derivable, so start at 1
+  for (int lvl = 1; lvl < lvl_end; lvl++) {
+    int nval_in_level = 0;
+    for (int i = 0; i < s->page.num_values; i += block_size) {
+      auto const lidx = i + t;
+      auto const gidx = page_first_val_idx + lidx;
+      if (lidx < s->page.num_values && gidx < col_last_val_idx && lvl_data[gidx] == lvl) {
+        nval_in_level++;
+      }
+    }
+    __syncthreads();
+    auto const lvl_sum = block_reduce(temp_storage).Sum(nval_in_level);
+    if (t == 0) { hist[lvl] = lvl_sum; }
+  }
+}
+
+/**
+ * @brief Generate definition level histogram for a block of values.
+ *
+ * This is used when the max repetition level is 0 (no lists) and the definition
+ * level data is not calculated in advance for the entire column.
+ *
+ * @param hist Pointer to the histogram (size is max_def_level + 1)
+ * @param s Page encode state
+ * @param nrows Number of rows to process
+ * @param rle_numvals Index (relative to start of page) of the first level value
+ * @param maxlvl Last element of the histogram to encode (exclusive)
+ */
 template <int block_size>
-void __device__ gen_hist(uint32_t* hist,
-                         rle_page_enc_state_s const* s,
-                         uint32_t nrows,
-                         uint32_t rle_numvals,
-                         uint32_t maxlvl)
+void __device__ generate_def_level_histogram(uint32_t* hist,
+                                             rle_page_enc_state_s const* s,
+                                             uint32_t nrows,
+                                             uint32_t rle_numvals,
+                                             uint32_t maxlvl)
 {
   using block_reduce = cub::BlockReduce<uint32_t, block_size>;
   __shared__ typename block_reduce::TempStorage temp_storage;
   auto const t = threadIdx.x;
 
+  // Do a block sum for each level rather than each thread trying an atomicAdd.
+  // This way is much faster.
   auto const mylvl = s->vals[rolling_index<rle_buffer_size>(rle_numvals + t)];
-  for (uint32_t lvl = 0; lvl < maxlvl; lvl++) {
+  // We can start at 1 because hist[0] can be derived.
+  for (uint32_t lvl = 1; lvl < maxlvl; lvl++) {
     uint32_t const is_yes = t < nrows and mylvl == lvl;
     auto const lvl_sum    = block_reduce(temp_storage).Sum(is_yes);
     if (t == 0) { hist[lvl] += lvl_sum; }
     __syncthreads();
   }
-  __syncthreads();
 }
 
 // operator to use with warp_reduce. stolen from cub::Sum
@@ -477,6 +542,7 @@ __global__ void __launch_bounds__(128)
     uint32_t rows_in_page        = 0;
     uint32_t values_in_page      = 0;
     uint32_t leaf_values_in_page = 0;
+    uint32_t num_valid           = 0;
     size_t page_size             = 0;
     size_t var_bytes_size        = 0;
     uint32_t num_pages           = 0;
@@ -625,6 +691,7 @@ __global__ void __launch_bounds__(128)
           page_g.num_rows           = rows_in_page;
           page_g.num_leaf_values    = leaf_values_in_page;
           page_g.num_values         = values_in_page;
+          page_g.num_valid          = num_valid;
           auto const def_level_size = max_RLE_page_size(col_g.num_def_level_bits(), values_in_page);
           auto const rep_level_size = max_RLE_page_size(col_g.num_rep_level_bits(), values_in_page);
           // get a different bound if using delta encoding
@@ -637,11 +704,11 @@ __global__ void __launch_bounds__(128)
           if (max_data_size > std::numeric_limits<int32_t>::max()) {
             CUDF_UNREACHABLE("page size exceeds maximum for i32");
           }
-          // if byte_array, then we need to save the variable bytes size
+          // if byte_array then save the variable bytes size
           if (ck_g.col_desc->physical_type == BYTE_ARRAY) {
-            // page size is the sum of frag sizes, and frag sizes for strings includes the
+            // Page size is the sum of frag sizes, and frag sizes for strings includes the
             // 4-byte length indicator, so subtract that.
-            page_g.var_bytes_size = var_bytes_size - page_g.num_leaf_values * sizeof(size_type);
+            page_g.var_bytes_size = var_bytes_size;
           }
           page_g.max_data_size    = static_cast<uint32_t>(max_data_size);
           pagestats_g.start_chunk = ck_g.first_fragment + page_start;
@@ -691,16 +758,19 @@ __global__ void __launch_bounds__(128)
         rows_in_page        = 0;
         values_in_page      = 0;
         leaf_values_in_page = 0;
+        num_valid           = 0;
         page_start          = fragments_in_chunk;
         max_stats_len       = 0;
       }
       max_stats_len = max(max_stats_len, minmax_len);
       num_dict_entries += frag_g.num_dict_vals;
       page_size += fragment_data_size;
-      var_bytes_size += frag_g.fragment_data_size;
+      // fragment_data_size includes the length indicator...remove it
+      var_bytes_size += frag_g.fragment_data_size - frag_g.num_valid * sizeof(size_type);
       rows_in_page += frag_g.num_rows;
       values_in_page += frag_g.num_values;
       leaf_values_in_page += frag_g.num_leaf_values;
+      num_valid += frag_g.num_valid;
       num_rows += frag_g.num_rows;
       fragments_in_chunk++;
     } while (frag_g.num_rows != 0);
@@ -1235,9 +1305,12 @@ __global__ void __launch_bounds__(block_size, 8) gpuEncodePageLevels(device_span
         }();
         s->vals[rolling_idx(rle_numvals + t)] = def_lvl;
         __syncthreads();
-        if (s->page.def_histogram != nullptr) {
-          gen_hist<block_size>(
-            s->page.def_histogram, s, nrows, rle_numvals, s->col.max_def_level + 1);
+        // if max_def <= 1, then the histogram is trivial to calculate
+        if (s->page.def_histogram != nullptr and s->col.max_def_level > 1) {
+          // Only calculate up to max_def_level...the last entry is valid_count and will be filled
+          // in later.
+          generate_def_level_histogram<block_size>(
+            s->page.def_histogram, s, nrows, rle_numvals, s->col.max_def_level);
         }
         rle_numvals += nrows;
         RleEncode(s, rle_numvals, def_lvl_bits, (rle_numvals == s->page.num_rows), t);
@@ -1260,11 +1333,7 @@ __global__ void __launch_bounds__(block_size, 8) gpuEncodePageLevels(device_span
   } else if (s->page.page_type != PageType::DICTIONARY_PAGE &&
              s->col.num_rep_level_bits() != 0  // This means there ARE repetition levels (has list)
   ) {
-    auto encode_levels = [&](uint8_t const* lvl_val_data,
-                             uint32_t nbits,
-                             uint32_t& lvl_bytes,
-                             uint32_t* hist,
-                             uint32_t max_lvl) {
+    auto encode_levels = [&](uint8_t const* lvl_val_data, uint32_t nbits, uint32_t& lvl_bytes) {
       // For list types, the repetition and definition levels are pre-calculated. We just need to
       // encode and write them now.
       if (!t) {
@@ -1287,7 +1356,6 @@ __global__ void __launch_bounds__(block_size, 8) gpuEncodePageLevels(device_span
           (rle_numvals + t < s->page.num_values && idx < col_last_val_idx) ? lvl_val_data[idx] : 0;
         s->vals[rolling_idx(rle_numvals + t)] = lvl_val;
         __syncthreads();
-        if (hist != nullptr) { gen_hist<block_size>(hist, s, nvals, rle_numvals, max_lvl); }
         rle_numvals += nvals;
         RleEncode(s, rle_numvals, nbits, (rle_numvals == s->page.num_values), t);
         __syncthreads();
@@ -1306,17 +1374,9 @@ __global__ void __launch_bounds__(block_size, 8) gpuEncodePageLevels(device_span
         }
       }
     };
-    encode_levels(s->col.rep_values,
-                  s->col.num_rep_level_bits(),
-                  s->page.rep_lvl_bytes,
-                  s->page.rep_histogram,
-                  s->col.max_rep_level + 1);
+    encode_levels(s->col.rep_values, s->col.num_rep_level_bits(), s->page.rep_lvl_bytes);
     __syncthreads();
-    encode_levels(s->col.def_values,
-                  s->col.num_def_level_bits(),
-                  s->page.def_lvl_bytes,
-                  s->page.def_histogram,
-                  s->col.max_def_level + 1);
+    encode_levels(s->col.def_values, s->col.num_def_level_bits(), s->page.def_lvl_bytes);
   }
 
   if (t == 0) { pages[blockIdx.x] = s->page; }
@@ -1324,7 +1384,6 @@ __global__ void __launch_bounds__(block_size, 8) gpuEncodePageLevels(device_span
 
 template <int block_size, typename state_buf>
 __device__ void finish_page_encode(state_buf* s,
-                                   uint32_t valid_count,
                                    uint8_t const* end_ptr,
                                    device_span<EncPage> pages,
                                    device_span<device_span<uint8_t const>> comp_in,
@@ -1338,9 +1397,62 @@ __device__ void finish_page_encode(state_buf* s,
   size_t const skip_comp_size =
     write_v2_headers ? s->page.def_lvl_bytes + s->page.rep_lvl_bytes : 0;
 
+  // this will be true if max_rep > 0 (i.e. there are lists)
+  if (s->page.rep_histogram != nullptr) {
+    // for repetition we get hist[0] from num_rows, and can derive hist[max_rep_level]
+    if (s->col.max_rep_level > 1) {
+      generate_page_histogram<block_size>(
+        s->page.rep_histogram, s, s->col.rep_values, s->col.max_rep_level);
+    }
+
+    if (t == 0) {
+      s->page.rep_histogram[0] = s->page.num_rows;
+      uint32_t hist_n          = s->page.num_values - s->page.num_rows;
+      for (int i = 1; i < s->col.max_rep_level; i++) {
+        hist_n -= s->page.rep_histogram[i];
+      }
+      s->page.rep_histogram[s->col.max_rep_level] = hist_n;
+    }
+    __syncthreads();
+
+    if (s->page.def_histogram != nullptr) {
+      // For definition, we know h`ist[max_rep_level] = valid_count`. If the leaf level is
+      // nullable, then `hist[max_rep_level - 1] = num_leaf_values - valid_count`. Finally,
+      // hist[0] can be derived as `num_values - sum(hist[1]..hist[max_rep_level])`.
+      bool const is_leaf_nullable = s->col.leaf_column->nullable();
+      auto const last_lvl = is_leaf_nullable ? s->col.max_def_level - 1 : s->col.max_def_level;
+      if (last_lvl > 1) {
+        generate_page_histogram<block_size>(s->page.def_histogram, s, s->col.def_values, last_lvl);
+      }
+
+      if (t == 0) {
+        s->page.def_histogram[s->col.max_def_level] = s->page.num_valid;
+        if (is_leaf_nullable) {
+          s->page.def_histogram[last_lvl] = s->page.num_leaf_values - s->page.num_valid;
+        }
+        uint32_t hist_0 = s->page.num_values - s->page.num_leaf_values;
+        for (int i = 1; i < last_lvl; i++) {
+          hist_0 -= s->page.def_histogram[i];
+        }
+        s->page.def_histogram[0] = hist_0;
+      }
+    }
+  } else if (s->page.def_histogram != nullptr) {
+    // finish off what was started in generate_def_level_histogram
+    if (t == 0) {
+      s->page.def_histogram[s->col.max_def_level] = s->page.num_valid;
+
+      uint32_t hist_0 = s->page.num_values - s->page.num_valid;
+      for (int i = 1; i < s->col.max_def_level; i++) {
+        hist_0 -= s->page.def_histogram[i];
+      }
+      s->page.def_histogram[0] = hist_0;
+    }
+  }
+
   if (t == 0) {
     // only need num_nulls for v2 data page headers
-    if (write_v2_headers) { s->page.num_nulls = s->page.num_values - valid_count; }
+    if (write_v2_headers) { s->page.num_nulls = s->page.num_values - s->page.num_valid; }
     uint8_t const* const base   = s->page.page_data + s->page.max_hdr_size;
     auto const actual_data_size = static_cast<uint32_t>(end_ptr - base);
     if (actual_data_size > s->page.max_data_size) {
@@ -1381,12 +1493,8 @@ __global__ void __launch_bounds__(block_size, 8)
                  bool write_v2_headers)
 {
   __shared__ __align__(8) page_enc_state_s<0> state_g;
-  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
-  using block_scan   = cub::BlockScan<uint32_t, block_size>;
-  __shared__ union {
-    typename block_reduce::TempStorage reduce_storage;
-    typename block_scan::TempStorage scan_storage;
-  } temp_storage;
+  using block_scan = cub::BlockScan<uint32_t, block_size>;
+  __shared__ typename block_scan::TempStorage scan_storage;
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -1434,7 +1542,6 @@ __global__ void __launch_bounds__(block_size, 8)
   }
   __syncthreads();
 
-  uint32_t num_valid = 0;
   for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
     uint32_t nvals = min(s->page.num_leaf_values - cur_val_idx, block_size);
     uint32_t len, pos;
@@ -1460,7 +1567,6 @@ __global__ void __launch_bounds__(block_size, 8)
       return std::make_tuple(is_valid, val_idx);
     }();
 
-    if (is_valid) { num_valid++; }
     cur_val_idx += nvals;
 
     // Non-dictionary encoding
@@ -1480,7 +1586,7 @@ __global__ void __launch_bounds__(block_size, 8)
       len = 0;
     }
     uint32_t total_len = 0;
-    block_scan(temp_storage.scan_storage).ExclusiveSum(len, pos, total_len);
+    block_scan(scan_storage).ExclusiveSum(len, pos, total_len);
     __syncthreads();
     if (t == 0) { s->cur = dst + total_len; }
     if (is_valid) {
@@ -1607,10 +1713,8 @@ __global__ void __launch_bounds__(block_size, 8)
     __syncthreads();
   }
 
-  uint32_t const valid_count = block_reduce(temp_storage.reduce_storage).Sum(num_valid);
-
   finish_page_encode<block_size>(
-    s, valid_count, s->cur, pages, comp_in, comp_out, comp_results, write_v2_headers);
+    s, s->cur, pages, comp_in, comp_out, comp_results, write_v2_headers);
 }
 
 // DICTIONARY page data encoder
@@ -1624,12 +1728,8 @@ __global__ void __launch_bounds__(block_size, 8)
                      bool write_v2_headers)
 {
   __shared__ __align__(8) rle_page_enc_state_s state_g;
-  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
-  using block_scan   = cub::BlockScan<uint32_t, block_size>;
-  __shared__ union {
-    typename block_reduce::TempStorage reduce_storage;
-    typename block_scan::TempStorage scan_storage;
-  } temp_storage;
+  using block_scan = cub::BlockScan<uint32_t, block_size>;
+  __shared__ typename block_scan::TempStorage scan_storage;
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -1690,7 +1790,6 @@ __global__ void __launch_bounds__(block_size, 8)
   }
   __syncthreads();
 
-  uint32_t num_valid = 0;
   for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
     uint32_t nvals = min(s->page.num_leaf_values - cur_val_idx, block_size);
 
@@ -1708,7 +1807,6 @@ __global__ void __launch_bounds__(block_size, 8)
       return std::make_tuple(is_valid, val_idx);
     }();
 
-    if (is_valid) { num_valid++; }
     cur_val_idx += nvals;
 
     // Dictionary encoding
@@ -1716,7 +1814,7 @@ __global__ void __launch_bounds__(block_size, 8)
       uint32_t rle_numvals;
       uint32_t rle_numvals_in_block;
       uint32_t pos;
-      block_scan(temp_storage.scan_storage).ExclusiveSum(is_valid, pos, rle_numvals_in_block);
+      block_scan(scan_storage).ExclusiveSum(is_valid, pos, rle_numvals_in_block);
       rle_numvals = s->rle_numvals;
       if (is_valid) {
         uint32_t v;
@@ -1740,8 +1838,6 @@ __global__ void __launch_bounds__(block_size, 8)
     __syncthreads();
   }
 
-  uint32_t const valid_count = block_reduce(temp_storage.reduce_storage).Sum(num_valid);
-
   // save RLE length if necessary
   if (s->rle_len_pos != nullptr && t < 32) {
     // size doesn't include the 4 bytes for the length
@@ -1751,7 +1847,7 @@ __global__ void __launch_bounds__(block_size, 8)
   }
 
   finish_page_encode<block_size>(
-    s, valid_count, s->cur, pages, comp_in, comp_out, comp_results, write_v2_headers);
+    s, s->cur, pages, comp_in, comp_out, comp_results, write_v2_headers);
 }
 
 // DELTA_BINARY_PACKED page data encoder
@@ -1766,9 +1862,7 @@ __global__ void __launch_bounds__(block_size, 8)
   // block of shared memory for value storage and bit packing
   __shared__ uleb128_t delta_shared[delta::buffer_size + delta::block_size];
   __shared__ __align__(8) page_enc_state_s<0> state_g;
-  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
   __shared__ union {
-    typename block_reduce::TempStorage reduce_storage;
     typename delta::index_scan::TempStorage delta_index_tmp;
     typename delta::block_reduce::TempStorage delta_reduce_tmp;
     typename delta::warp_reduce::TempStorage delta_warp_red_tmp[delta::num_mini_blocks];
@@ -1814,58 +1908,36 @@ __global__ void __launch_bounds__(block_size, 8)
   }
   __syncthreads();
 
-  // need to know the number of valid values for the null values calculation and to size
-  // the delta binary encoder.
-  uint32_t valid_count = 0;
-  if (not s->col.leaf_column->nullable()) {
-    valid_count = s->page.num_leaf_values;
-  } else {
-    uint32_t num_valid = 0;
-    for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
-      uint32_t const nvals                = min(s->page.num_leaf_values - cur_val_idx, block_size);
-      size_type const val_idx_in_block    = cur_val_idx + t;
-      size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
-
-      if (val_idx_in_leaf_col < s->col.leaf_column->size() &&
-          val_idx_in_block < s->page.num_leaf_values &&
-          s->col.leaf_column->is_valid(val_idx_in_leaf_col)) {
-        num_valid++;
-      }
-      cur_val_idx += nvals;
-    }
-    valid_count = block_reduce(temp_storage.reduce_storage).Sum(num_valid);
-  }
-
   uint8_t const* delta_ptr = nullptr;  // this will be the end of delta block pointer
 
   if (physical_type == INT32) {
     switch (dtype_len_in) {
       case 8: {
         // only DURATIONS map to 8 bytes, so safe to just use signed here?
-        delta_ptr = delta_encode<int64_t>(s, valid_count, delta_shared, &temp_storage);
+        delta_ptr = delta_encode<int64_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         break;
       }
       case 4: {
         if (type_id == type_id::UINT32) {
-          delta_ptr = delta_encode<uint32_t>(s, valid_count, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<uint32_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         } else {
-          delta_ptr = delta_encode<int32_t>(s, valid_count, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<int32_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         }
         break;
       }
       case 2: {
         if (type_id == type_id::UINT16) {
-          delta_ptr = delta_encode<uint16_t>(s, valid_count, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<uint16_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         } else {
-          delta_ptr = delta_encode<int16_t>(s, valid_count, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<int16_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         }
         break;
       }
       case 1: {
         if (type_id == type_id::UINT8) {
-          delta_ptr = delta_encode<uint8_t>(s, valid_count, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<uint8_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         } else {
-          delta_ptr = delta_encode<int8_t>(s, valid_count, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<int8_t>(s, s->page.num_valid, delta_shared, &temp_storage);
         }
         break;
       }
@@ -1873,14 +1945,13 @@ __global__ void __launch_bounds__(block_size, 8)
     }
   } else {
     if (type_id == type_id::UINT64) {
-      delta_ptr = delta_encode<uint64_t>(s, valid_count, delta_shared, &temp_storage);
+      delta_ptr = delta_encode<uint64_t>(s, s->page.num_valid, delta_shared, &temp_storage);
     } else {
-      delta_ptr = delta_encode<int64_t>(s, valid_count, delta_shared, &temp_storage);
+      delta_ptr = delta_encode<int64_t>(s, s->page.num_valid, delta_shared, &temp_storage);
     }
   }
 
-  finish_page_encode<block_size>(
-    s, valid_count, delta_ptr, pages, comp_in, comp_out, comp_results, true);
+  finish_page_encode<block_size>(s, delta_ptr, pages, comp_in, comp_out, comp_results, true);
 }
 
 constexpr int decide_compression_warps_in_block = 4;
@@ -2697,13 +2768,6 @@ __global__ void __launch_bounds__(1)
   auto const ck_rep_hist = ck_g->rep_histogram_data + (num_data_pages) * (cd->max_rep_level + 1);
 
   // optionally encode histograms and sum var_bytes.
-  auto const need_var_bytes = col_g.physical_type == BYTE_ARRAY;
-
-  // TODO(ets): if the spec retains the current organization for the histograms, then we should
-  // be able to do a linear scan here across all the histograms of the chunk.
-  // {ck_g->def_histogram_data,ck_def_hist} would be the start/end bounds. this might complicate
-  // the chunk histogram calculation though...would still need nested loop or use mod to get the
-  // level index.
   if (cd->max_rep_level > REP_LVL_HIST_CUTOFF) {
     encoder.field_list_begin(6, num_data_pages * (cd->max_rep_level + 1), ST_FLD_I64);
     for (uint32_t page = first_data_page; page < num_pages; page++) {
@@ -2728,7 +2792,7 @@ __global__ void __launch_bounds__(1)
     encoder.field_list_end(7);
   }
 
-  if (need_var_bytes) {
+  if (col_g.physical_type == BYTE_ARRAY) {
     for (uint32_t page = first_data_page; page < num_pages; page++) {
       auto const& pg = ck_g->pages[page];
       var_bytes += pg.var_bytes_size;

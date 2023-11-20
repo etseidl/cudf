@@ -31,9 +31,6 @@ namespace cudf::io::parquet::detail {
 
 constexpr uint32_t parquet_magic = (('P' << 0) | ('A' << 8) | ('R' << 16) | ('1' << 24));
 
-constexpr std::string_view COL_META_SIZES_OFFSET = "sizes_offset";
-constexpr std::string_view COL_META_SIZES_SIZE   = "sizes_size";
-
 /**
  * @brief Struct that describes the Parquet file data header
  */
@@ -265,20 +262,12 @@ struct Statistics {
 };
 
 /**
- * @brief Thrift-derived struct describing a key-value pair, for user metadata
- */
-struct KeyValue {
-  std::string key;
-  std::string value;
-};
-
-/**
  * @brief Thrift-derived struct containing statistics used to estimate page and column chunk sizes
  */
 struct SizeStatistics {
-  // number of variable-width bytes stored for the page/chunk. should not be set for anything
+  // Number of variable-width bytes stored for the page/chunk. Should not be set for anything
   // but the BYTE_ARRAY physical type.
-  thrust::optional<int64_t> unencoded_byte_array_data_bytes = thrust::nullopt;
+  thrust::optional<int64_t> unencoded_byte_array_data_bytes;
   /**
    * When present, there is expected to be one element corresponding to each
    * repetition (i.e. size=max repetition_level+1) where each element
@@ -287,14 +276,14 @@ struct SizeStatistics {
    *
    * This value should not be written if max_repetition_level is 0.
    */
-  thrust::optional<std::vector<int64_t>> repetition_level_histogram = thrust::nullopt;
+  thrust::optional<std::vector<int64_t>> repetition_level_histogram;
 
   /**
    * Same as repetition_level_histogram except for definition levels.
    *
    * This value should not be written if max_definition_level is 0 or 1.
    */
-  thrust::optional<std::vector<int64_t>> definition_level_histogram = thrust::nullopt;
+  thrust::optional<std::vector<int64_t>> definition_level_histogram;
 };
 
 /**
@@ -315,7 +304,7 @@ struct OffsetIndex {
   std::vector<PageLocation> page_locations;
   // per-page size info. see description of the same field in SizeStatistics. only present for
   // columns with a BYTE_ARRAY physical type.
-  thrust::optional<std::vector<int64_t>> unencoded_byte_array_data_bytes = thrust::nullopt;
+  thrust::optional<std::vector<int64_t>> unencoded_byte_array_data_bytes;
 };
 
 /**
@@ -328,9 +317,9 @@ struct ColumnIndex {
   BoundaryOrder boundary_order =
     BoundaryOrder::UNORDERED;        // Indicates if min and max values are ordered
   std::vector<int64_t> null_counts;  // Optional count of null values per page
-  // repetition/definition level histograms for the column chunk
-  thrust::optional<std::vector<int64_t>> repetition_level_histogram = thrust::nullopt;
-  thrust::optional<std::vector<int64_t>> definition_level_histogram = thrust::nullopt;
+  // Repetition/definition level histograms for the column chunk
+  thrust::optional<std::vector<int64_t>> repetition_level_histogram;
+  thrust::optional<std::vector<int64_t>> definition_level_histogram;
 };
 
 /**
@@ -346,14 +335,12 @@ struct ColumnChunkMetaData {
     0;  // total byte size of all uncompressed pages in this column chunk (including the headers)
   int64_t total_compressed_size =
     0;  // total byte size of all compressed pages in this column chunk (including the headers)
-  std::vector<KeyValue> key_value_metadata;  // per chunk metadata
   int64_t data_page_offset  = 0;  // Byte offset from beginning of file to first data page
   int64_t index_page_offset = 0;  // Byte offset from beginning of file to root index page
   int64_t dictionary_page_offset =
     0;                    // Byte offset from the beginning of file to first (only) dictionary page
   Statistics statistics;  // Encoded chunk-level statistics
-  thrust::optional<SizeStatistics> size_statistics =
-    thrust::nullopt;  // Size statistics for the chunk
+  thrust::optional<SizeStatistics> size_statistics;  // Size statistics for the chunk
 };
 
 /**
@@ -375,7 +362,7 @@ struct ColumnChunk {
 
   // Following fields are derived from other fields
   int schema_idx = -1;  // Index in flattened schema (derived from path_in_schema)
-  // the indexes don't really live here, but it's a convenient place to hang them
+  // The indexes don't really live here, but it's a convenient place to hang them.
   std::optional<OffsetIndex> offset_index;
   std::optional<ColumnIndex> column_index;
 };
@@ -390,6 +377,14 @@ struct RowGroup {
   int64_t total_byte_size = 0;
   std::vector<ColumnChunk> columns;
   int64_t num_rows = 0;
+};
+
+/**
+ * @brief Thrift-derived struct describing a key-value pair, for user metadata
+ */
+struct KeyValue {
+  std::string key;
+  std::string value;
 };
 
 /**
