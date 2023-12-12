@@ -83,39 +83,51 @@ inline __device__ zigzag128_t get_zz128(uint8_t const*& cur, uint8_t const* end)
   return static_cast<zigzag128_t>((u >> 1u) ^ -static_cast<zigzag128_t>(u & 1));
 }
 
-struct delta_binary_decoder {
-  uint8_t const* block_start;  // start of data, but updated as data is read
-  uint8_t const* block_end;    // end of data
-  uleb128_t block_size;        // usually 128, must be multiple of 128
-  uleb128_t mini_block_count;  // usually 4, chosen such that block_size/mini_block_count is a
-                               // multiple of 32
-  uleb128_t value_count;       // total values encoded in the block
-  zigzag128_t first_value;     // initial value, stored in the header
-  zigzag128_t last_value;      // last value decoded
+class delta_binary_decoder {
+ private:
+  uint8_t const* _block_start;  // start of data, but updated as data is read
+  uint8_t const* _block_end;    // end of data
+  uleb128_t _block_size;        // usually 128, must be multiple of 128
+  uleb128_t _mini_block_count;  // usually 4, chosen such that block_size/mini_block_count is a
+                                // multiple of 32
+  uleb128_t _value_count;       // total values encoded in the block
+  zigzag128_t _first_value;     // initial value, stored in the header
+  zigzag128_t _last_value;      // last value decoded
 
-  uint32_t values_per_mb;      // block_size / mini_block_count, must be multiple of 32
-  uint32_t current_value_idx;  // current value index, initialized to 0 at start of block
+  uint32_t _values_per_mb;      // block_size / mini_block_count, must be multiple of 32
+  uint32_t _current_value_idx;  // current value index, initialized to 0 at start of block
 
-  zigzag128_t cur_min_delta;     // min delta for the block
-  uint32_t cur_mb;               // index of the current mini-block within the block
-  uint8_t const* cur_mb_start;   // pointer to the start of the current mini-block data
-  uint8_t const* cur_bitwidths;  // pointer to the bitwidth array in the block
+  zigzag128_t _cur_min_delta;     // min delta for the block
+  uint32_t _cur_mb;               // index of the current mini-block within the block
+  uint8_t const* _cur_mb_start;   // pointer to the start of the current mini-block data
+  uint8_t const* _cur_bitwidths;  // pointer to the bitwidth array in the block
 
-  zigzag128_t value[delta_rolling_buf_size];  // circular buffer of delta values
+  zigzag128_t _value[delta_rolling_buf_size];  // circular buffer of delta values
+
+ public:
+  constexpr auto values_per_miniblock() const { return _values_per_mb; }
+
+  constexpr auto current_index() const { return _current_value_idx; }
+
+  constexpr bool parameters_align(delta_binary_decoder const& other) const
+  {
+    return _values_per_mb == other._values_per_mb and _block_size == other._block_size and
+           _value_count == other._value_count;
+  }
 
   // returns the value stored in the `value` array at index
-  // `rolling_index<delta_rolling_buf_size>(idx)`. If `idx` is `0`, then return `first_value`.
-  constexpr zigzag128_t value_at(size_type idx)
+  // `rolling_index<delta_rolling_buf_size>(idx)`. If `idx` is `0`, then return `_first_value`.
+  constexpr zigzag128_t value_at(size_type idx) const
   {
-    return idx == 0 ? first_value : value[rolling_index<delta_rolling_buf_size>(idx)];
+    return idx == 0 ? _first_value : _value[rolling_index<delta_rolling_buf_size>(idx)];
   }
 
   // returns the number of values encoded in the block data. when all_values is true,
   // account for the first value in the header. otherwise just count the values encoded
   // in the mini-block data.
-  constexpr uint32_t num_encoded_values(bool all_values)
+  constexpr uint32_t num_encoded_values(bool all_values) const
   {
-    return value_count == 0 ? 0 : all_values ? value_count : value_count - 1;
+    return _value_count == 0 ? 0 : all_values ? _value_count : _value_count - 1;
   }
 
   // read mini-block header into state object. should only be called from init_binary_block or
@@ -123,22 +135,22 @@ struct delta_binary_decoder {
   //
   // | min delta (int) | bit-width array (1 byte * mini_block_count) |
   //
-  // on exit db->cur_mb is 0 and db->cur_mb_start points to the first mini-block of data, or
+  // on exit db->_cur_mb is 0 and db->_cur_mb_start points to the first mini-block of data, or
   // nullptr if out of data.
   // is_decode indicates whether this is being called from initialization code (false) or
   // the actual decoding (true)
   inline __device__ void init_mini_block(bool is_decode)
   {
-    cur_mb       = 0;
-    cur_mb_start = nullptr;
+    _cur_mb       = 0;
+    _cur_mb_start = nullptr;
 
-    if (current_value_idx < num_encoded_values(is_decode)) {
-      auto d_start  = block_start;
-      cur_min_delta = get_zz128(d_start, block_end);
-      cur_bitwidths = d_start;
+    if (_current_value_idx < num_encoded_values(is_decode)) {
+      auto d_start   = _block_start;
+      _cur_min_delta = get_zz128(d_start, _block_end);
+      _cur_bitwidths = d_start;
 
-      d_start += mini_block_count;
-      cur_mb_start = d_start;
+      d_start += _mini_block_count;
+      _cur_mb_start = d_start;
     }
   }
 
@@ -149,21 +161,21 @@ struct delta_binary_decoder {
   // also initializes the first mini-block before exit
   inline __device__ void init_binary_block(uint8_t const* d_start, uint8_t const* d_end)
   {
-    block_end        = d_end;
-    block_size       = get_uleb128(d_start, d_end);
-    mini_block_count = get_uleb128(d_start, d_end);
-    value_count      = get_uleb128(d_start, d_end);
-    first_value      = get_zz128(d_start, d_end);
-    last_value       = first_value;
+    _block_end        = d_end;
+    _block_size       = get_uleb128(d_start, d_end);
+    _mini_block_count = get_uleb128(d_start, d_end);
+    _value_count      = get_uleb128(d_start, d_end);
+    _first_value      = get_zz128(d_start, d_end);
+    _last_value       = _first_value;
 
-    current_value_idx = 0;
-    values_per_mb     = block_size / mini_block_count;
+    _current_value_idx = 0;
+    _values_per_mb     = _block_size / _mini_block_count;
 
     // init the first mini-block
-    block_start = d_start;
+    _block_start = d_start;
 
     // only call init if there are actually encoded values
-    if (value_count > 1) { init_mini_block(false); }
+    if (_value_count > 1) { init_mini_block(false); }
   }
 
   // skip to the start of the next mini-block. should only be called on thread 0.
@@ -172,18 +184,18 @@ struct delta_binary_decoder {
   // the actual decoding (true)
   inline __device__ void setup_next_mini_block(bool is_decode)
   {
-    if (current_value_idx >= num_encoded_values(is_decode)) { return; }
+    if (_current_value_idx >= num_encoded_values(is_decode)) { return; }
 
-    current_value_idx += values_per_mb;
+    _current_value_idx += _values_per_mb;
 
     // just set pointer to start of next mini_block
-    if (cur_mb < mini_block_count - 1) {
-      cur_mb_start += cur_bitwidths[cur_mb] * values_per_mb / 8;
-      cur_mb++;
+    if (_cur_mb < _mini_block_count - 1) {
+      _cur_mb_start += _cur_bitwidths[_cur_mb] * _values_per_mb / 8;
+      _cur_mb++;
     }
     // out of mini-blocks, start a new block
     else {
-      block_start = cur_mb_start + cur_bitwidths[cur_mb] * values_per_mb / 8;
+      _block_start = _cur_mb_start + _cur_bitwidths[_cur_mb] * _values_per_mb / 8;
       init_mini_block(is_decode);
     }
   }
@@ -197,14 +209,14 @@ struct delta_binary_decoder {
     init_binary_block(start, end);
 
     // test for no encoded values. a single value will be in the block header.
-    if (value_count <= 1) { return block_start; }
+    if (_value_count <= 1) { return _block_start; }
 
     // read mini-block headers and skip over data
-    while (current_value_idx < num_encoded_values(false)) {
+    while (_current_value_idx < num_encoded_values(false)) {
       setup_next_mini_block(false);
     }
     // calculate the correct end of the block
-    auto const* const new_end = cur_mb == 0 ? block_start : cur_mb_start;
+    auto const* const new_end = _cur_mb == 0 ? _block_start : _cur_mb_start;
     // re-init block with correct end
     init_binary_block(start, new_end);
     return new_end;
@@ -215,21 +227,21 @@ struct delta_binary_decoder {
   inline __device__ void calc_mini_block_values(int lane_id)
   {
     using cudf::detail::warp_size;
-    if (current_value_idx >= value_count) { return; }
+    if (_current_value_idx >= _value_count) { return; }
 
     // need to account for the first value from header on first pass
-    if (current_value_idx == 0) {
-      if (lane_id == 0) { current_value_idx++; }
+    if (_current_value_idx == 0) {
+      if (lane_id == 0) { _current_value_idx++; }
       __syncwarp();
-      if (current_value_idx >= value_count) { return; }
+      if (_current_value_idx >= _value_count) { return; }
     }
 
-    uint32_t const mb_bits = cur_bitwidths[cur_mb];
+    uint32_t const mb_bits = _cur_bitwidths[_cur_mb];
 
     // need to do in multiple passes if values_per_mb != 32
-    uint32_t const num_pass = values_per_mb / warp_size;
+    uint32_t const num_pass = _values_per_mb / warp_size;
 
-    auto d_start = cur_mb_start;
+    auto d_start = _cur_mb_start;
 
     for (int i = 0; i < num_pass; i++) {
       // position at end of the current mini-block since the following calculates
@@ -244,15 +256,15 @@ struct delta_binary_decoder {
       // looping version is just as fast and easier to read. Might need to revisit this when
       // DELTA_BYTE_ARRAY is implemented.
       zigzag128_t delta = 0;
-      if (lane_id + current_value_idx < value_count) {
+      if (lane_id + _current_value_idx < _value_count) {
         int32_t ofs      = (lane_id - warp_size) * mb_bits;
         uint8_t const* p = d_start + (ofs >> 3);
         ofs &= 7;
-        if (p < block_end) {
+        if (p < _block_end) {
           uint32_t c = 8 - ofs;  // 0 - 7 bits
           delta      = (*p++) >> ofs;
 
-          while (c < mb_bits && p < block_end) {
+          while (c < mb_bits && p < _block_end) {
             delta |= static_cast<zigzag128_t>(*p++) << c;
             c += 8;
           }
@@ -261,21 +273,21 @@ struct delta_binary_decoder {
       }
 
       // add min delta to get true delta
-      delta += cur_min_delta;
+      delta += _cur_min_delta;
 
       // do inclusive scan to get value - first_value at each position
       __shared__ cub::WarpScan<int64_t>::TempStorage temp_storage;
       cub::WarpScan<int64_t>(temp_storage).InclusiveSum(delta, delta);
 
       // now add first value from header or last value from previous block to get true value
-      delta += last_value;
+      delta += _last_value;
       int const value_idx =
-        rolling_index<delta_rolling_buf_size>(current_value_idx + warp_size * i + lane_id);
-      value[value_idx] = delta;
+        rolling_index<delta_rolling_buf_size>(_current_value_idx + warp_size * i + lane_id);
+      _value[value_idx] = delta;
 
       // save value from last lane in warp. this will become the 'first value' added to the
       // deltas calculated in the next iteration (or invocation).
-      if (lane_id == warp_size - 1) { last_value = delta; }
+      if (lane_id == warp_size - 1) { _last_value = delta; }
       __syncwarp();
     }
   }
@@ -288,7 +300,7 @@ struct delta_binary_decoder {
     int const t       = threadIdx.x;
     int const lane_id = t % warp_size;
 
-    while (current_value_idx < skip && current_value_idx < num_encoded_values(true)) {
+    while (_current_value_idx < skip && _current_value_idx < num_encoded_values(true)) {
       if (t < warp_size) {
         calc_mini_block_values(lane_id);
         if (lane_id == 0) { setup_next_mini_block(true); }
@@ -320,13 +332,13 @@ struct delta_binary_decoder {
     if (skip == 1) { return sum; }
 
     // need to do in multiple passes if values_per_mb != 32
-    uint32_t const num_pass = values_per_mb / warp_size;
+    uint32_t const num_pass = _values_per_mb / warp_size;
 
-    while (current_value_idx < skip && current_value_idx < num_encoded_values(true)) {
+    while (_current_value_idx < skip && _current_value_idx < num_encoded_values(true)) {
       if (t < warp_size) {
         calc_mini_block_values(t);
 
-        int const idx = current_value_idx + t;
+        int const idx = _current_value_idx + t;
 
         for (uint32_t p = 0; p < num_pass; p++) {
           auto const pidx     = idx + p * warp_size;

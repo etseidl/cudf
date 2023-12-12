@@ -47,6 +47,8 @@ struct delta_byte_array_decoder {
   delta_binary_decoder prefixes;  // state of decoder for prefix lengths
   delta_binary_decoder suffixes;  // state of decoder for suffix lengths
 
+  __device__ bool parameters_align() const { return prefixes.parameters_align(suffixes); }
+
   // initialize the prefixes and suffixes blocks
   __device__ void init(uint8_t const* start, uint8_t const* end, uint32_t start_idx, uint8_t* temp)
   {
@@ -133,9 +135,9 @@ struct delta_byte_array_decoder {
     using WarpScan = cub::WarpScan<uint64_t>;
     __shared__ WarpScan::TempStorage scan_temp;
 
-    if (start_idx >= suffixes.value_count) { return 0; }
-    auto end_idx = start_idx + min(suffixes.values_per_mb, num_values);
-    end_idx      = min(end_idx, static_cast<uint32_t>(suffixes.value_count));
+    if (start_idx >= suffixes.num_encoded_values(true)) { return 0; }
+    auto end_idx = start_idx + min(suffixes.values_per_miniblock(), num_values);
+    end_idx      = min(end_idx, static_cast<uint32_t>(suffixes.num_encoded_values(true)));
 
     auto p_strings_out = strings_out;
     auto p_temp_out    = temp_buf;
@@ -215,9 +217,9 @@ struct delta_byte_array_decoder {
     using cudf::detail::warp_size;
     __shared__ __align__(8) uint8_t* so_ptr;
 
-    if (start_idx >= suffixes.value_count) { return 0; }
-    auto end_idx = start_idx + min(suffixes.values_per_mb, num_values);
-    end_idx      = min(end_idx, static_cast<uint32_t>(suffixes.value_count));
+    if (start_idx >= suffixes.num_encoded_values(true)) { return 0; }
+    auto end_idx = start_idx + min(suffixes.values_per_miniblock(), num_values);
+    end_idx      = min(end_idx, static_cast<uint32_t>(suffixes.num_encoded_values(true)));
 
     if (lane_id == 0) { so_ptr = start_idx < start_val ? temp_buf : strings_out; }
     __syncwarp();
@@ -271,10 +273,10 @@ struct delta_byte_array_decoder {
     if (start_val >= prefixes.num_encoded_values(true)) { return; }
 
     // prefixes and suffixes will have the same parameters (it's checked earlier)
-    auto const batch_size = prefixes.values_per_mb;
+    auto const batch_size = prefixes.values_per_miniblock();
 
     uint32_t skip_pos = 0;
-    while (prefixes.current_value_idx < start_val) {
+    while (prefixes.current_index() < start_val) {
       // warp 0 gets prefixes and warp 1 gets suffixes
       auto* const db = t < 32 ? &prefixes : &suffixes;
 
@@ -294,7 +296,7 @@ struct delta_byte_array_decoder {
           last_string = temp_buf + bytes_written;
         }
       }
-      skip_pos += prefixes.values_per_mb;
+      skip_pos += prefixes.values_per_miniblock();
       __syncthreads();
     }
   }
@@ -346,7 +348,7 @@ __global__ void __launch_bounds__(96)
   if (t == 0) { db->init_binary_block(s->data_start, s->data_end); }
   __syncthreads();
 
-  auto const batch_size = db->values_per_mb;
+  auto const batch_size = db->values_per_miniblock();
   if (batch_size > max_delta_mini_block_size) {
     set_error(static_cast<kernel_error::value_type>(decode_error::DELTA_PARAMS_UNSUPPORTED),
               error_code);
@@ -475,9 +477,7 @@ __global__ void __launch_bounds__(decode_block_size)
   __syncthreads();
 
   // assert that prefix and suffix have same mini-block size
-  if (prefix_db->values_per_mb != suffix_db->values_per_mb or
-      prefix_db->block_size != suffix_db->block_size or
-      prefix_db->value_count != suffix_db->value_count) {
+  if (not dba->parameters_align()) {
     set_error(static_cast<kernel_error::value_type>(decode_error::DELTA_PARAM_MISMATCH),
               error_code);
     return;
@@ -488,7 +488,7 @@ __global__ void __launch_bounds__(decode_block_size)
   auto strings_data          = nesting_info_base[leaf_level_index].string_out;
 
   // sanity check to make sure we can process this page
-  auto const batch_size = prefix_db->values_per_mb;
+  auto const batch_size = prefix_db->values_per_miniblock();
   if (batch_size > max_delta_mini_block_size) {
     set_error(static_cast<kernel_error::value_type>(decode_error::DELTA_PARAMS_UNSUPPORTED),
               error_code);
@@ -628,7 +628,7 @@ __global__ void __launch_bounds__(decode_block_size)
   int const leaf_level_index = s->col.max_nesting_depth - 1;
 
   // sanity check to make sure we can process this page
-  auto const batch_size = db->values_per_mb;
+  auto const batch_size = db->values_per_miniblock();
   if (batch_size > max_delta_mini_block_size) {
     set_error(static_cast<int32_t>(decode_error::DELTA_PARAMS_UNSUPPORTED), error_code);
     return;

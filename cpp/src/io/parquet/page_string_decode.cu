@@ -520,21 +520,20 @@ __device__ thrust::pair<size_t, size_t> totalDeltaByteArraySize(uint8_t const* d
 
   if (db != nullptr) {
     // initialize with first value (which is stored in last_value)
-    if (lane_id == 0 && start_value == 0) { total_bytes = db->last_value; }
+    if (lane_id == 0 && start_value == 0) { total_bytes = db->value_at(0); }
 
     uleb128_t lane_sum = 0;
     uleb128_t lane_max = 0;
-    while (db->current_value_idx < end_value &&
-           db->current_value_idx < db->num_encoded_values(true)) {
+    while (db->current_index() < end_value && db->current_index() < db->num_encoded_values(true)) {
       // calculate values for current mini-block
       db->calc_mini_block_values(lane_id);
 
       // get per lane sum for mini-block
-      for (uint32_t i = 0; i < db->values_per_mb; i += 32) {
-        uint32_t const idx = db->current_value_idx + i + lane_id;
-        if (idx >= start_value && idx < end_value && idx < db->value_count) {
-          lane_sum += db->value[rolling_index<delta_rolling_buf_size>(idx)];
-          lane_max = max(lane_max, db->value[rolling_index<delta_rolling_buf_size>(idx)]);
+      for (uint32_t i = 0; i < db->values_per_miniblock(); i += 32) {
+        uint32_t const idx = db->current_index() + i + lane_id;
+        if (idx >= start_value && idx < end_value && idx < db->num_encoded_values(true)) {
+          lane_sum += db->value_at(idx);
+          lane_max = max(lane_max, db->value_at(idx));
         }
       }
 
@@ -562,7 +561,7 @@ __device__ thrust::pair<size_t, size_t> totalDeltaByteArraySize(uint8_t const* d
   // by the number of strings in a mini-block, plus one to save the last string.
   auto const temp_bytes =
     cudf::detail::single_lane_block_sum_reduce<delta_preproc_block_size, 0>(max_len) *
-    (db->values_per_mb + 1);
+    (db->values_per_miniblock() + 1);
 
   return {final_bytes, temp_bytes};
 }
@@ -676,7 +675,7 @@ __global__ void __launch_bounds__(delta_preproc_block_size) gpuComputeDeltaPageS
         delta_binary_decoder db;
         db.init_binary_block(s->data_start, s->data_end);
         // save enough for one mini-block plus some extra to save the last_string
-        pp->temp_string_size = s->dtype_len_in * (db.values_per_mb + 1);
+        pp->temp_string_size = s->dtype_len_in * (db.values_per_miniblock() + 1);
       }
     }
   } else {
@@ -762,17 +761,18 @@ __global__ void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLength
     // initialize with first value
     if (t == 0 && start_value == 0) { total_bytes = string_lengths.value_at(0); }
 
-    uleb128_t lane_sum = 0;
-    while (string_lengths.current_value_idx < end_value &&
-           string_lengths.current_value_idx < string_lengths.num_encoded_values(true)) {
+    auto const num_values = string_lengths.num_encoded_values(true);
+    uleb128_t lane_sum    = 0;
+    while (string_lengths.current_index() < end_value &&
+           string_lengths.current_index() < num_values) {
       // calculate values for current mini-block
       string_lengths.calc_mini_block_values(t);
 
       // get per lane sum for mini-block
-      for (uint32_t i = 0; i < string_lengths.values_per_mb; i += warp_size) {
-        uint32_t const idx = string_lengths.current_value_idx + i + t;
-        if (idx >= start_value && idx < end_value && idx < string_lengths.value_count) {
-          lane_sum += string_lengths.value[rolling_index<delta_rolling_buf_size>(idx)];
+      for (uint32_t i = 0; i < string_lengths.values_per_miniblock(); i += warp_size) {
+        uint32_t const idx = string_lengths.current_index() + i + t;
+        if (idx >= start_value && idx < end_value && idx < num_values) {
+          lane_sum += string_lengths.value_at(idx);
         }
       }
 
