@@ -160,8 +160,6 @@ struct aggregate_writer_metadata {
   auto& file(size_t p) { return files[p]; }
   [[nodiscard]] size_t num_files() const { return files.size(); }
 
-  [[nodiscard]] auto const& get_schema() const { return schema; }
-
  private:
   int32_t version = 0;
   std::vector<SchemaElement> schema;
@@ -1940,15 +1938,6 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   thrust::uninitialized_fill(
     rmm::exec_policy_nosync(stream), rep_level_histogram.begin(), rep_level_histogram.end(), 0);
 
-  // making these hostdevice because we'll need this on the host to sum up the histograms
-  cudf::detail::hostdevice_vector<uint32_t> def_level_histogram(def_histogram_bfr_size, stream);
-  cudf::detail::hostdevice_vector<uint32_t> rep_level_histogram(rep_histogram_bfr_size, stream);
-
-  thrust::uninitialized_fill(
-    rmm::exec_policy(stream), def_level_histogram.d_begin(), def_level_histogram.d_end(), 0);
-  thrust::uninitialized_fill(
-    rmm::exec_policy(stream), rep_level_histogram.d_begin(), rep_level_histogram.d_end(), 0);
-
   // This contains stats for both the pages and the rowgroups. TODO: make them separate.
   rmm::device_uvector<statistics_chunk> page_stats(num_stats_bfr, stream);
   auto bfr_i = static_cast<uint8_t*>(col_idx_bfr.data());
@@ -2369,7 +2358,6 @@ void writer::impl::write_parquet_data_to_sink(
   if (_stats_granularity == statistics_freq::STATISTICS_COLUMN) {
     // need pages on host to create offset_indexes
     auto const h_pages = cudf::detail::make_host_vector_sync(pages, _stream);
-    auto const& schema = _agg_meta->get_schema();
 
     // add column and offset indexes to metadata
     for (auto b = 0, r = 0; b < static_cast<size_type>(batch_list.size()); b++) {
