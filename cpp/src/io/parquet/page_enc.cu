@@ -205,8 +205,9 @@ void __device__ calculate_frag_size(frag_init_state_s* const s, int t)
       }
     }
   }
+
+  auto const total_len = block_reduce(reduce_storage).Sum(len);
   __syncthreads();
-  auto const total_len   = block_reduce(reduce_storage).Sum(len);
   auto const total_valid = block_reduce(reduce_storage).Sum(num_valid);
 
   if (t == 0) {
@@ -216,7 +217,8 @@ void __device__ calculate_frag_size(frag_init_state_s* const s, int t)
 
   __syncthreads();
   // page fragment size must fit in a 32-bit signed integer
-  if (s->frag.fragment_data_size > std::numeric_limits<int32_t>::max()) {
+  if (s->frag.fragment_data_size > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+    // TODO need to propagate this error back to the host
     CUDF_UNREACHABLE("page fragment size exceeds maximum for i32");
   }
 }
@@ -337,19 +339,17 @@ struct BitwiseOr {
   }
 };
 
-// I is the column type from the input table
-template <typename I>
-__device__ uint8_t const* delta_encode(page_enc_state_s<0>* s,
-                                       uint32_t valid_count,
-                                       uint64_t* buffer,
-                                       void* temp_space)
+// PT is the parquet physical type (INT32 or INT64).
+// I is the column type from the input table.
+template <Type PT, typename I>
+__device__ uint8_t const* delta_encode(page_enc_state_s<0>* s, uint64_t* buffer, void* temp_space)
 {
-  using output_type = std::conditional_t<std::is_signed_v<I>, zigzag128_t, uleb128_t>;
+  using output_type = std::conditional_t<PT == INT32, int32_t, int64_t>;
   __shared__ delta_binary_packer<output_type> packer;
 
   auto const t = threadIdx.x;
   if (t == 0) {
-    packer.init(s->cur, valid_count, reinterpret_cast<output_type*>(buffer), temp_space);
+    packer.init(s->cur, s->page.num_valid, reinterpret_cast<output_type*>(buffer), temp_space);
   }
   __syncthreads();
 
@@ -735,7 +735,7 @@ __global__ void __launch_bounds__(128)
               page_g.kernel_mask = encode_kernel_mask::PLAIN;
             }
             // need space for the chunk histograms plus data page histograms
-            auto const num_histograms = num_pages - (ck_g.use_dictionary ? 1 : 0);
+            auto const num_histograms = num_pages - ck_g.num_dict_pages();
             if (ck_g.def_histogram_data != nullptr && col_g.max_def_level > 0) {
               page_g.def_histogram =
                 ck_g.def_histogram_data + num_histograms * (col_g.max_def_level + 1);
@@ -1393,6 +1393,13 @@ __device__ void finish_page_encode(state_buf* s,
 {
   auto const t = threadIdx.x;
 
+  // returns sum of histogram values from [1..max_level)
+  auto histogram_sum = [](uint32_t* const hist, int max_level) {
+    auto const hist_start = hist + 1;
+    auto const hist_end   = hist + max_level;
+    return thrust::reduce(thrust::seq, hist_start, hist_end, 0U);
+  };
+
   // V2 does not compress rep and def level data
   size_t const skip_comp_size =
     write_v2_headers ? s->page.def_lvl_bytes + s->page.rep_lvl_bytes : 0;
@@ -1406,19 +1413,19 @@ __device__ void finish_page_encode(state_buf* s,
     }
 
     if (t == 0) {
+      // rep_hist[0] is num_rows, we have rep_hist[1..max_rep_level) calculated, so
+      // rep_hist[max_rep_level] is num_values minus the sum of the preceding values.
       s->page.rep_histogram[0] = s->page.num_rows;
-      uint32_t hist_n          = s->page.num_values - s->page.num_rows;
-      for (int i = 1; i < s->col.max_rep_level; i++) {
-        hist_n -= s->page.rep_histogram[i];
-      }
-      s->page.rep_histogram[s->col.max_rep_level] = hist_n;
+      s->page.rep_histogram[s->col.max_rep_level] =
+        s->page.num_values - s->page.num_rows -
+        histogram_sum(s->page.rep_histogram, s->col.max_rep_level);
     }
     __syncthreads();
 
     if (s->page.def_histogram != nullptr) {
-      // For definition, we know h`ist[max_rep_level] = valid_count`. If the leaf level is
-      // nullable, then `hist[max_rep_level - 1] = num_leaf_values - valid_count`. Finally,
-      // hist[0] can be derived as `num_values - sum(hist[1]..hist[max_rep_level])`.
+      // For definition, we know `hist[max_def_level] = num_valid`. If the leaf level is
+      // nullable, then `hist[max_def_level - 1] = num_leaf_values - num_valid`. Finally,
+      // hist[0] can be derived as `num_values - sum(hist[1]..hist[max_def_level])`.
       bool const is_leaf_nullable = s->col.leaf_column->nullable();
       auto const last_lvl = is_leaf_nullable ? s->col.max_def_level - 1 : s->col.max_def_level;
       if (last_lvl > 1) {
@@ -1430,23 +1437,17 @@ __device__ void finish_page_encode(state_buf* s,
         if (is_leaf_nullable) {
           s->page.def_histogram[last_lvl] = s->page.num_leaf_values - s->page.num_valid;
         }
-        uint32_t hist_0 = s->page.num_values - s->page.num_leaf_values;
-        for (int i = 1; i < last_lvl; i++) {
-          hist_0 -= s->page.def_histogram[i];
-        }
-        s->page.def_histogram[0] = hist_0;
+        s->page.def_histogram[0] = s->page.num_values - s->page.num_leaf_values -
+                                   histogram_sum(s->page.def_histogram, last_lvl);
       }
     }
   } else if (s->page.def_histogram != nullptr) {
     // finish off what was started in generate_def_level_histogram
     if (t == 0) {
+      // `hist[max_def_level] = num_valid`, and the values for hist[1..max_def_level) are known
       s->page.def_histogram[s->col.max_def_level] = s->page.num_valid;
-
-      uint32_t hist_0 = s->page.num_values - s->page.num_valid;
-      for (int i = 1; i < s->col.max_def_level; i++) {
-        hist_0 -= s->page.def_histogram[i];
-      }
-      s->page.def_histogram[0] = hist_0;
+      s->page.def_histogram[0]                    = s->page.num_values - s->page.num_valid -
+                                 histogram_sum(s->page.def_histogram, s->col.max_def_level);
     }
   }
 
@@ -1863,9 +1864,10 @@ __global__ void __launch_bounds__(block_size, 8)
   __shared__ uleb128_t delta_shared[delta::buffer_size + delta::block_size];
   __shared__ __align__(8) page_enc_state_s<0> state_g;
   __shared__ union {
-    typename delta::index_scan::TempStorage delta_index_tmp;
-    typename delta::block_reduce::TempStorage delta_reduce_tmp;
-    typename delta::warp_reduce::TempStorage delta_warp_red_tmp[delta::num_mini_blocks];
+    typename delta_binary_packer<uleb128_t>::index_scan::TempStorage delta_index_tmp;
+    typename delta_binary_packer<uleb128_t>::block_reduce::TempStorage delta_reduce_tmp;
+    typename delta_binary_packer<uleb128_t>::warp_reduce::TempStorage
+      delta_warp_red_tmp[delta::num_mini_blocks];
   } temp_storage;
 
   auto* const s = &state_g;
@@ -1914,30 +1916,30 @@ __global__ void __launch_bounds__(block_size, 8)
     switch (dtype_len_in) {
       case 8: {
         // only DURATIONS map to 8 bytes, so safe to just use signed here?
-        delta_ptr = delta_encode<int64_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+        delta_ptr = delta_encode<INT32, int64_t>(s, delta_shared, &temp_storage);
         break;
       }
       case 4: {
         if (type_id == type_id::UINT32) {
-          delta_ptr = delta_encode<uint32_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<INT32, uint32_t>(s, delta_shared, &temp_storage);
         } else {
-          delta_ptr = delta_encode<int32_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<INT32, int32_t>(s, delta_shared, &temp_storage);
         }
         break;
       }
       case 2: {
         if (type_id == type_id::UINT16) {
-          delta_ptr = delta_encode<uint16_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<INT32, uint16_t>(s, delta_shared, &temp_storage);
         } else {
-          delta_ptr = delta_encode<int16_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<INT32, int16_t>(s, delta_shared, &temp_storage);
         }
         break;
       }
       case 1: {
         if (type_id == type_id::UINT8) {
-          delta_ptr = delta_encode<uint8_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<INT32, uint8_t>(s, delta_shared, &temp_storage);
         } else {
-          delta_ptr = delta_encode<int8_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+          delta_ptr = delta_encode<INT32, int8_t>(s, delta_shared, &temp_storage);
         }
         break;
       }
@@ -1945,9 +1947,9 @@ __global__ void __launch_bounds__(block_size, 8)
     }
   } else {
     if (type_id == type_id::UINT64) {
-      delta_ptr = delta_encode<uint64_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+      delta_ptr = delta_encode<INT64, uint64_t>(s, delta_shared, &temp_storage);
     } else {
-      delta_ptr = delta_encode<int64_t>(s, s->page.num_valid, delta_shared, &temp_storage);
+      delta_ptr = delta_encode<INT64, int64_t>(s, delta_shared, &temp_storage);
     }
   }
 
@@ -2767,36 +2769,36 @@ __global__ void __launch_bounds__(1)
   auto const ck_def_hist = ck_g->def_histogram_data + (num_data_pages) * (cd->max_def_level + 1);
   auto const ck_rep_hist = ck_g->rep_histogram_data + (num_data_pages) * (cd->max_rep_level + 1);
 
+  auto const page_start = ck_g->pages + first_data_page;
+  auto const page_end   = ck_g->pages + ck_g->num_pages;
+
   // optionally encode histograms and sum var_bytes.
   if (cd->max_rep_level > REP_LVL_HIST_CUTOFF) {
     encoder.field_list_begin(6, num_data_pages * (cd->max_rep_level + 1), ST_FLD_I64);
-    for (uint32_t page = first_data_page; page < num_pages; page++) {
-      auto const& pg = ck_g->pages[page];
+    thrust::for_each(thrust::seq, page_start, page_end, [&] __device__(auto const& page) {
       for (int i = 0; i < cd->max_rep_level + 1; i++) {
-        encoder.put_int64(pg.rep_histogram[i]);
-        ck_rep_hist[i] += pg.rep_histogram[i];
+        encoder.put_int64(page.rep_histogram[i]);
+        ck_rep_hist[i] += page.rep_histogram[i];
       }
-    }
+    });
     encoder.field_list_end(6);
   }
 
   if (cd->max_def_level > DEF_LVL_HIST_CUTOFF) {
     encoder.field_list_begin(7, num_data_pages * (cd->max_def_level + 1), ST_FLD_I64);
-    for (uint32_t page = first_data_page; page < num_pages; page++) {
-      auto const& pg = ck_g->pages[page];
+    thrust::for_each(thrust::seq, page_start, page_end, [&] __device__(auto const& page) {
       for (int i = 0; i < cd->max_def_level + 1; i++) {
-        encoder.put_int64(pg.def_histogram[i]);
-        ck_def_hist[i] += pg.def_histogram[i];
+        encoder.put_int64(page.def_histogram[i]);
+        ck_def_hist[i] += page.def_histogram[i];
       }
-    }
+    });
     encoder.field_list_end(7);
   }
 
   if (col_g.physical_type == BYTE_ARRAY) {
-    for (uint32_t page = first_data_page; page < num_pages; page++) {
-      auto const& pg = ck_g->pages[page];
-      var_bytes += pg.var_bytes_size;
-    }
+    thrust::for_each(thrust::seq, page_start, page_end, [&] __device__(auto const& page) {
+      var_bytes += page.var_bytes_size;
+    });
   }
 
   encoder.end(&col_idx_end, false);

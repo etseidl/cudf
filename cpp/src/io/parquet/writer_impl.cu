@@ -1435,10 +1435,11 @@ size_t column_index_buffer_size(EncColumnChunk* ck,
 
   // additional storage needed for SizeStatistics
   // don't need stats for dictionary pages
-  auto const num_pages = ck->num_pages - (ck->use_dictionary ? 1 : 0);
+  auto const num_pages = ck->num_data_pages();
 
   // only need variable length size info for BYTE_ARRAY
   // 1 byte for marker, 1 byte vec type, 4 bytes length, 5 bytes per page for values
+  // (5 bytes is needed because the varint encoder only encodes 7 bits per byte)
   auto const var_bytes_size = col.physical_type == BYTE_ARRAY ? 6 + 5 * num_pages : 0;
 
   // for the histograms, need 1 byte for marker, 1 byte vec type, 4 bytes length,
@@ -1448,11 +1449,8 @@ size_t column_index_buffer_size(EncColumnChunk* ck,
   auto const def_hist_size = has_def ? 6 + 5 * num_pages * (col.max_def_level + 1) : 0;
   auto const rep_hist_size = has_rep ? 6 + 5 * num_pages * (col.max_rep_level + 1) : 0;
 
-  // for optional RepDefHist we need 1 byte of field marker, 1 byte end-of-struct
-  auto const rep_def_struct_size = (has_def or has_rep ? 2 : 0) + def_hist_size + rep_hist_size;
-
   // total size of SizeStruct is 1 byte marker, 1 byte end-of-struct, plus sizes for components
-  auto const size_struct_size = 2 + rep_def_struct_size + var_bytes_size;
+  auto const size_struct_size = 2 + def_hist_size + rep_hist_size + var_bytes_size;
 
   // calculating this per-chunk because the sizes can be wildly different.
   constexpr size_t padding = 7;
@@ -1888,7 +1886,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
           // SizeStatistics are on the ColumnIndex, so only need to allocate the histograms data
           // if we're doing page-level indexes. add 1 to num_pages for per-chunk histograms.
-          auto const num_histograms = ck->num_pages - (ck->use_dictionary ? 1 : 0) + 1;
+          auto const num_histograms = ck->num_data_pages() + 1;
 
           if (col.max_def_level > DEF_LVL_HIST_CUTOFF) {
             def_histogram_bfr_size += (col.max_def_level + 1) * num_histograms;
@@ -1934,6 +1932,13 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
   rmm::device_buffer col_idx_bfr(column_index_bfr_size, stream);
   rmm::device_uvector<EncPage> pages(num_pages, stream);
+  rmm::device_uvector<uint32_t> def_level_histogram(def_histogram_bfr_size, stream);
+  rmm::device_uvector<uint32_t> rep_level_histogram(rep_histogram_bfr_size, stream);
+
+  thrust::uninitialized_fill(
+    rmm::exec_policy_nosync(stream), def_level_histogram.begin(), def_level_histogram.end(), 0);
+  thrust::uninitialized_fill(
+    rmm::exec_policy_nosync(stream), rep_level_histogram.begin(), rep_level_histogram.end(), 0);
 
   // making these hostdevice because we'll need this on the host to sum up the histograms
   cudf::detail::hostdevice_vector<uint32_t> def_level_histogram(def_histogram_bfr_size, stream);
@@ -1947,8 +1952,8 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   // This contains stats for both the pages and the rowgroups. TODO: make them separate.
   rmm::device_uvector<statistics_chunk> page_stats(num_stats_bfr, stream);
   auto bfr_i = static_cast<uint8_t*>(col_idx_bfr.data());
-  auto bfr_r = static_cast<uint32_t*>(rep_level_histogram.device_ptr());
-  auto bfr_d = static_cast<uint32_t*>(def_level_histogram.device_ptr());
+  auto bfr_r = rep_level_histogram.data();
+  auto bfr_d = def_level_histogram.data();
   for (auto b = 0, r = 0; b < static_cast<size_type>(batch_list.size()); b++) {
     auto bfr   = static_cast<uint8_t*>(uncomp_bfr.data());
     auto bfr_c = static_cast<uint8_t*>(comp_bfr.data());
@@ -1965,7 +1970,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
           ck.column_index_size = column_index_buffer_size(&ck, col, column_index_truncate_length);
           bfr_i += ck.column_index_size;
 
-          auto const num_histograms = ck.num_pages - (ck.use_dictionary ? 1 : 0) + 1;
+          auto const num_histograms = ck.num_data_pages() + 1;
           if (col.max_def_level > DEF_LVL_HIST_CUTOFF) {
             ck.def_histogram_data = bfr_d;
             bfr_d += num_histograms * (col.max_def_level + 1);
@@ -2003,10 +2008,10 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   if (collect_compression_statistics) { comp_stats = writer_compression_statistics{}; }
 
   // Encode row groups in batches
-  for (auto b = 0, r = 0; b < static_cast<size_type>(batch_list.size()); b++) {
+  for (auto b = 0, batch_r_start = 0; b < static_cast<size_type>(batch_list.size()); b++) {
     // Count pages in this batch
-    auto const rnext               = r + batch_list[b];
-    auto const first_page_in_batch = chunks[r][0].first_page;
+    auto const rnext               = batch_r_start + batch_list[b];
+    auto const first_page_in_batch = chunks[batch_r_start][0].first_page;
     auto const first_page_in_next_batch =
       (rnext < num_rowgroups) ? chunks[rnext][0].first_page : num_pages;
     auto const pages_in_batch = first_page_in_next_batch - first_page_in_batch;
@@ -2017,7 +2022,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
       pages_in_batch,
       first_page_in_batch,
       batch_list[b],
-      r,
+      batch_r_start,
       (stats_granularity == statistics_freq::STATISTICS_PAGE) ? page_stats.data() : nullptr,
       (stats_granularity != statistics_freq::STATISTICS_NONE) ? page_stats.data() + num_pages
                                                               : nullptr,
@@ -2030,15 +2035,23 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
     bool need_sync{false};
 
-    // need to bring back the histogram data
+    // need to fetch the histogram data from the device
+    std::vector<uint32_t> h_def_histogram;
+    std::vector<uint32_t> h_rep_histogram;
     if (stats_granularity == statistics_freq::STATISTICS_COLUMN) {
-      if (def_histogram_bfr_size > 0) { def_level_histogram.device_to_host_async(stream); }
-      if (rep_histogram_bfr_size > 0) { rep_level_histogram.device_to_host_async(stream); }
-      need_sync = true;
+      if (def_histogram_bfr_size > 0) {
+        h_def_histogram =
+          std::move(cudf::detail::make_std_vector_async(def_level_histogram, stream));
+        need_sync = true;
+      }
+      if (rep_histogram_bfr_size > 0) {
+        h_rep_histogram =
+          std::move(cudf::detail::make_std_vector_async(rep_level_histogram, stream));
+        need_sync = true;
+      }
     }
 
-    [[maybe_unused]] auto save_r = r;
-    for (; r < rnext; r++) {
+    for (int r = batch_r_start; r < rnext; r++) {
       int p           = rg_to_part[r];
       int global_r    = global_rowgroup_base[p] + r - first_rg_in_part[p];
       auto& row_group = agg_meta->file(p).row_groups[global_r];
@@ -2075,17 +2088,16 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
 
     // now add to the column chunk SizeStatistics if necessary
     if (stats_granularity == statistics_freq::STATISTICS_COLUMN) {
-      auto h_def_ptr = def_level_histogram.host_ptr();
-      auto h_rep_ptr = rep_level_histogram.host_ptr();
+      auto h_def_ptr = h_def_histogram.data();
+      auto h_rep_ptr = h_rep_histogram.data();
 
-      auto const rnext = save_r + batch_list[b];
-      for (; save_r < rnext; save_r++) {
-        int const p        = rg_to_part[save_r];
-        int const global_r = global_rowgroup_base[p] + save_r - first_rg_in_part[p];
+      for (int r = batch_r_start; r < rnext; r++) {
+        int const p        = rg_to_part[r];
+        int const global_r = global_rowgroup_base[p] + r - first_rg_in_part[p];
         auto& row_group    = agg_meta->file(p).row_groups[global_r];
 
         for (auto i = 0; i < num_columns; i++) {
-          auto const& ck          = chunks[save_r][i];
+          auto const& ck          = chunks[r][i];
           auto const& col         = col_desc[ck.col_desc_id];
           auto& column_chunk_meta = row_group.columns[i].meta_data;
 
@@ -2099,7 +2111,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
             chunk_stats.unencoded_byte_array_data_bytes = ck.var_bytes_size;
           }
 
-          auto const num_data_pages = ck.num_pages - (ck.use_dictionary ? 1 : 0);
+          auto const num_data_pages = ck.num_data_pages();
           if (col.max_def_level > DEF_LVL_HIST_CUTOFF) {
             size_t const hist_size        = col.max_def_level + 1;
             uint32_t const* const ck_hist = h_def_ptr + hist_size * num_data_pages;
@@ -2121,11 +2133,13 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
           if (chunk_stats.unencoded_byte_array_data_bytes.has_value() ||
               chunk_stats.definition_level_histogram.has_value() ||
               chunk_stats.repetition_level_histogram.has_value()) {
-            column_chunk_meta.size_statistics = chunk_stats;
+            column_chunk_meta.size_statistics = std::move(chunk_stats);
           }
         }
       }
     }
+
+    batch_r_start = rnext;
   }
 
   auto bounce_buffer =
