@@ -36,14 +36,16 @@ constexpr int decode_block_size = 128;
 // and a suffix is stored. The prefix lengths are DELTA_BINARY_PACKED encoded. The suffixes are
 // encoded with DELTA_LENGTH_BYTE_ARRAY encoding, which is a DELTA_BINARY_PACKED list of suffix
 // lengths, followed by the concatenated suffix data.
-struct delta_byte_array_decoder {
-  uint8_t const* last_string;       // pointer to last decoded string...needed for its prefix
-  uint8_t const* suffix_char_data;  // pointer to the start of character data
+class delta_byte_array_decoder {
+ private:
+  uint8_t const* _last_string;       // pointer to last decoded string...needed for its prefix
+  uint8_t const* _suffix_char_data;  // pointer to the start of character data
 
-  uint8_t* temp_buf;         // buffer used when skipping values
-  uint32_t start_val;        // decoded strings up to this index will be dumped to temp_buf
-  uint32_t last_string_len;  // length of the last decoded string
+  uint8_t* _temp_buf;         // buffer used when skipping values
+  uint32_t _start_val;        // decoded strings up to this index will be dumped to _temp_buf
+  uint32_t _last_string_len;  // length of the last decoded string
 
+ public:
   delta_binary_decoder prefixes;  // state of decoder for prefix lengths
   delta_binary_decoder suffixes;  // state of decoder for suffix lengths
 
@@ -53,10 +55,10 @@ struct delta_byte_array_decoder {
   __device__ void init(uint8_t const* start, uint8_t const* end, uint32_t start_idx, uint8_t* temp)
   {
     auto const* suffix_start = prefixes.find_end_of_block(start, end);
-    suffix_char_data         = suffixes.find_end_of_block(suffix_start, end);
-    last_string              = nullptr;
-    temp_buf                 = temp;
-    start_val                = start_idx;
+    _suffix_char_data        = suffixes.find_end_of_block(suffix_start, end);
+    _last_string             = nullptr;
+    _temp_buf                = temp;
+    _start_val               = start_idx;
   }
 
   // kind of like an inclusive scan for strings. takes prefix_len bytes from preceding
@@ -140,7 +142,7 @@ struct delta_byte_array_decoder {
     end_idx      = min(end_idx, static_cast<uint32_t>(suffixes.num_encoded_values(true)));
 
     auto p_strings_out = strings_out;
-    auto p_temp_out    = temp_buf;
+    auto p_temp_out    = _temp_buf;
 
     auto copy_batch = [&](uint8_t* out, uint32_t idx, uint32_t end) {
       uint32_t const ln_idx = idx + lane_id;
@@ -160,20 +162,20 @@ struct delta_byte_array_decoder {
       auto const so_ptr = out + string_off;
 
       // copy suffixes into string data
-      if (ln_idx < end) { memcpy(so_ptr + prefix_len, suffix_char_data + suffix_off, suffix_len); }
+      if (ln_idx < end) { memcpy(so_ptr + prefix_len, _suffix_char_data + suffix_off, suffix_len); }
       __syncwarp();
 
       // copy prefixes into string data.
-      string_scan(out, last_string, idx, end, string_off, lane_id);
+      string_scan(out, _last_string, idx, end, string_off, lane_id);
 
       // save the position of the last computed string. this will be used in
       // the next iteration to reconstruct the string in lane 0.
       if (ln_idx == end - 1 || (ln_idx < end && lane_id == 31)) {
-        // set last_string to this lane's string
-        last_string     = out + string_off;
-        last_string_len = string_len;
-        // and consume used suffix_char_data
-        suffix_char_data += suffix_off + suffix_len;
+        // set _last_string to this lane's string
+        _last_string     = out + string_off;
+        _last_string_len = string_len;
+        // and consume used _suffix_char_data
+        _suffix_char_data += suffix_off + suffix_len;
       }
 
       return warp_total;
@@ -183,17 +185,17 @@ struct delta_byte_array_decoder {
     for (int idx = start_idx; idx < end_idx; idx += warp_size) {
       auto const n_in_batch = min(warp_size, end_idx - idx);
       // account for the case where start_val occurs in the middle of this batch
-      if (idx < start_val && idx + n_in_batch > start_val) {
-        // dump idx...start_val into temp_buf
-        copy_batch(p_temp_out, idx, start_val);
+      if (idx < _start_val && idx + n_in_batch > _start_val) {
+        // dump idx...start_val into _temp_buf
+        copy_batch(p_temp_out, idx, _start_val);
         __syncwarp();
 
         // start_val...idx + n_in_batch into strings_out
-        auto nbytes = copy_batch(p_strings_out, start_val, idx + n_in_batch);
+        auto nbytes = copy_batch(p_strings_out, _start_val, idx + n_in_batch);
         p_strings_out += nbytes;
         string_total = nbytes;
       } else {
-        if (idx < start_val) {
+        if (idx < _start_val) {
           p_temp_out += copy_batch(p_temp_out, idx, end_idx);
         } else {
           auto nbytes = copy_batch(p_strings_out, idx, end_idx);
@@ -221,7 +223,7 @@ struct delta_byte_array_decoder {
     auto end_idx = start_idx + min(suffixes.values_per_miniblock(), num_values);
     end_idx      = min(end_idx, static_cast<uint32_t>(suffixes.num_encoded_values(true)));
 
-    if (lane_id == 0) { so_ptr = start_idx < start_val ? temp_buf : strings_out; }
+    if (lane_id == 0) { so_ptr = start_idx < _start_val ? _temp_buf : strings_out; }
     __syncwarp();
 
     uint64_t string_total = 0;
@@ -233,24 +235,24 @@ struct delta_byte_array_decoder {
       // copy prefix and suffix data into current strings_out position
       // for longer strings use a 4-byte version stolen from gather_chars_fn_string_parallel.
       if (string_len > 64) {
-        if (prefix_len > 0) { wideStrcpy(so_ptr, last_string, prefix_len, lane_id); }
+        if (prefix_len > 0) { wideStrcpy(so_ptr, _last_string, prefix_len, lane_id); }
         if (suffix_len > 0) {
-          wideStrcpy(so_ptr + prefix_len, suffix_char_data, suffix_len, lane_id);
+          wideStrcpy(so_ptr + prefix_len, _suffix_char_data, suffix_len, lane_id);
         }
       } else {
         for (int i = lane_id; i < string_len; i += warp_size) {
-          so_ptr[i] = i < prefix_len ? last_string[i] : suffix_char_data[i - prefix_len];
+          so_ptr[i] = i < prefix_len ? _last_string[i] : _suffix_char_data[i - prefix_len];
         }
       }
       __syncwarp();
 
-      if (idx >= start_val) { string_total += string_len; }
+      if (idx >= _start_val) { string_total += string_len; }
 
       if (lane_id == 0) {
-        last_string     = so_ptr;
-        last_string_len = string_len;
-        suffix_char_data += suffix_len;
-        if (idx == start_val - 1) {
+        _last_string     = so_ptr;
+        _last_string_len = string_len;
+        _suffix_char_data += suffix_len;
+        if (idx == _start_val - 1) {
           so_ptr = strings_out;
         } else {
           so_ptr += string_len;
@@ -270,13 +272,13 @@ struct delta_byte_array_decoder {
     int const lane_id = t % warp_size;
 
     // is this even necessary? return if asking to skip the whole block.
-    if (start_val >= prefixes.num_encoded_values(true)) { return; }
+    if (_start_val >= prefixes.num_encoded_values(true)) { return; }
 
     // prefixes and suffixes will have the same parameters (it's checked earlier)
     auto const batch_size = prefixes.values_per_miniblock();
 
     uint32_t skip_pos = 0;
-    while (prefixes.current_index() < start_val) {
+    while (prefixes.current_index() < _start_val) {
       // warp 0 gets prefixes and warp 1 gets suffixes
       auto* const db = t < 32 ? &prefixes : &suffixes;
 
@@ -286,14 +288,14 @@ struct delta_byte_array_decoder {
 
       // warp 0 decodes the batch.
       if (t < 32) {
-        auto const num_to_decode = min(batch_size, start_val - skip_pos);
+        auto const num_to_decode = min(batch_size, _start_val - skip_pos);
         auto const bytes_written =
-          use_char_ll ? calculate_string_values_cp(temp_buf, skip_pos, num_to_decode, lane_id)
-                      : calculate_string_values(temp_buf, skip_pos, num_to_decode, lane_id);
-        // store last_string someplace safe in temp buffer
+          use_char_ll ? calculate_string_values_cp(_temp_buf, skip_pos, num_to_decode, lane_id)
+                      : calculate_string_values(_temp_buf, skip_pos, num_to_decode, lane_id);
+        // store _last_string someplace safe in temp buffer
         if (t == 0) {
-          memcpy(temp_buf + bytes_written, last_string, last_string_len);
-          last_string = temp_buf + bytes_written;
+          memcpy(_temp_buf + bytes_written, _last_string, _last_string_len);
+          _last_string = _temp_buf + bytes_written;
         }
       }
       skip_pos += prefixes.values_per_miniblock();
