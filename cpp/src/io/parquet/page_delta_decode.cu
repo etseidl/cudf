@@ -371,7 +371,7 @@ __global__ void __launch_bounds__(96)
     } else {  // warp2
       target_pos = min(s->nz_count, src_pos + batch_size);
     }
-    // TODO(ets): see if this sync can be removed
+    // this needs to be here to prevent warp 2 modifying src_pos before all threads have read it
     __syncthreads();
 
     // warp0 will decode the rep/def levels, warp1 will unpack a mini-batch of deltas.
@@ -512,7 +512,7 @@ __global__ void __launch_bounds__(decode_block_size)
     } else {  // warp 3
       target_pos = min(s->nz_count, src_pos + batch_size);
     }
-    // TODO(ets): see if this sync can be removed
+    // this needs to be here to prevent warp 3 modifying src_pos before all threads have read it
     __syncthreads();
 
     // warp0 will decode the rep/def levels, warp1 will unpack a mini-batch of prefixes, warp 2 will
@@ -641,14 +641,16 @@ __global__ void __launch_bounds__(decode_block_size)
   // string data block.
   auto const is_bounds_pg = is_bounds_page(s, min_row, num_rows, has_repetition);
   if (is_bounds_pg && s->page.start_val > 0) {
-    // string_off is only valid on lane_id 0
-    auto const string_off = db->skip_values_and_sum(s->page.start_val);
-    if (t == 0) {
-      string_offset = string_off;
+    if (t < warp_size) {
+      // string_off is only valid on thread 0
+      auto const string_off = db->skip_values_and_sum(s->page.start_val);
+      if (t == 0) {
+        string_offset = string_off;
 
-      // if there is no repetition, then we need to work through the whole page, so reset the
-      // delta decoder to the beginning of the page
-      if (not has_repetition) { db->init_binary_block(s->data_start, s->data_end); }
+        // if there is no repetition, then we need to work through the whole page, so reset the
+        // delta decoder to the beginning of the page
+        if (not has_repetition) { db->init_binary_block(s->data_start, s->data_end); }
+      }
     }
     __syncthreads();
   }
@@ -732,13 +734,13 @@ __global__ void __launch_bounds__(decode_block_size)
 /**
  * @copydoc cudf::io::parquet::detail::DecodeDeltaBinary
  */
-void __host__ DecodeDeltaBinary(cudf::detail::hostdevice_vector<PageInfo>& pages,
-                                cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
-                                size_t num_rows,
-                                size_t min_row,
-                                int level_type_size,
-                                kernel_error::pointer error_code,
-                                rmm::cuda_stream_view stream)
+void DecodeDeltaBinary(cudf::detail::hostdevice_vector<PageInfo>& pages,
+                       cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
+                       size_t num_rows,
+                       size_t min_row,
+                       int level_type_size,
+                       kernel_error::pointer error_code,
+                       rmm::cuda_stream_view stream)
 {
   CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
 
@@ -757,13 +759,13 @@ void __host__ DecodeDeltaBinary(cudf::detail::hostdevice_vector<PageInfo>& pages
 /**
  * @copydoc cudf::io::parquet::gpu::DecodeDeltaByteArray
  */
-void __host__ DecodeDeltaByteArray(cudf::detail::hostdevice_vector<PageInfo>& pages,
-                                   cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
-                                   size_t num_rows,
-                                   size_t min_row,
-                                   int level_type_size,
-                                   kernel_error::pointer error_code,
-                                   rmm::cuda_stream_view stream)
+void DecodeDeltaByteArray(cudf::detail::hostdevice_vector<PageInfo>& pages,
+                          cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
+                          size_t num_rows,
+                          size_t min_row,
+                          int level_type_size,
+                          kernel_error::pointer error_code,
+                          rmm::cuda_stream_view stream)
 {
   CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
 
@@ -782,14 +784,13 @@ void __host__ DecodeDeltaByteArray(cudf::detail::hostdevice_vector<PageInfo>& pa
 /**
  * @copydoc cudf::io::parquet::gpu::DecodeDeltaByteArray
  */
-void __host__
-DecodeDeltaLengthByteArray(cudf::detail::hostdevice_vector<PageInfo>& pages,
-                           cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
-                           size_t num_rows,
-                           size_t min_row,
-                           int level_type_size,
-                           kernel_error::pointer error_code,
-                           rmm::cuda_stream_view stream)
+void DecodeDeltaLengthByteArray(cudf::detail::hostdevice_vector<PageInfo>& pages,
+                                cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
+                                size_t num_rows,
+                                size_t min_row,
+                                int level_type_size,
+                                kernel_error::pointer error_code,
+                                rmm::cuda_stream_view stream)
 {
   CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
 

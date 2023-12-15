@@ -225,9 +225,7 @@ void read_footer(std::unique_ptr<cudf::io::datasource> const& source,
     source->host_read(len - ender->footer_len - ender_len, ender->footer_len);
   cudf::io::parquet::detail::CompactProtocolReader cp(footer_buffer->data(), ender->footer_len);
 
-  // returns true on success
-  bool res = cp.read(file_meta_data);
-  ASSERT_TRUE(res);
+  cp.read(file_meta_data);
 }
 
 // returns the number of bits used for dictionary encoding data at the given page location.
@@ -242,8 +240,7 @@ int read_dict_bits(std::unique_ptr<cudf::io::datasource> const& source,
   cudf::io::parquet::detail::PageHeader page_hdr;
   auto const page_buf = source->host_read(page_loc.offset, page_loc.compressed_page_size);
   cudf::io::parquet::detail::CompactProtocolReader cp(page_buf->data(), page_buf->size());
-  bool res = cp.read(&page_hdr);
-  CUDF_EXPECTS(res, "Cannot parse page header");
+  cp.read(&page_hdr);
 
   // cp should be pointing at the start of page data now. the first byte
   // should be the encoding bit size
@@ -263,8 +260,7 @@ cudf::io::parquet::detail::ColumnIndex read_column_index(
   cudf::io::parquet::detail::ColumnIndex colidx;
   auto const ci_buf = source->host_read(chunk.column_index_offset, chunk.column_index_length);
   cudf::io::parquet::detail::CompactProtocolReader cp(ci_buf->data(), ci_buf->size());
-  bool res = cp.read(&colidx);
-  CUDF_EXPECTS(res, "Cannot parse column index");
+  cp.read(&colidx);
   return colidx;
 }
 
@@ -281,8 +277,7 @@ cudf::io::parquet::detail::OffsetIndex read_offset_index(
   cudf::io::parquet::detail::OffsetIndex offidx;
   auto const oi_buf = source->host_read(chunk.offset_index_offset, chunk.offset_index_length);
   cudf::io::parquet::detail::CompactProtocolReader cp(oi_buf->data(), oi_buf->size());
-  bool res = cp.read(&offidx);
-  CUDF_EXPECTS(res, "Cannot parse offset index");
+  cp.read(&offidx);
   return offidx;
 }
 
@@ -306,8 +301,7 @@ cudf::io::parquet::detail::PageHeader read_page_header(
   cudf::io::parquet::detail::PageHeader page_hdr;
   auto const page_buf = source->host_read(page_loc.offset, page_loc.compressed_page_size);
   cudf::io::parquet::detail::CompactProtocolReader cp(page_buf->data(), page_buf->size());
-  bool res = cp.read(&page_hdr);
-  CUDF_EXPECTS(res, "Cannot parse page header");
+  cp.read(&page_hdr);
   return page_hdr;
 }
 
@@ -7091,24 +7085,21 @@ TEST_F(ParquetReaderTest, RepeatedNoAnnotations)
   CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), expected);
 }
 
-inline auto random_validity()
+inline auto random_validity(std::mt19937& engine)
 {
-  constexpr auto seed = 21337;
-  static std::mt19937 engine{seed};
   static std::bernoulli_distribution bn(0.7f);
   return cudf::detail::make_counting_transform_iterator(0, [&](int index) { return bn(engine); });
 }
 
 template <typename T>
-std::unique_ptr<cudf::column> make_parquet_list_col(int num_rows,
+std::unique_ptr<cudf::column> make_parquet_list_col(std::mt19937& engine,
+                                                    int num_rows,
                                                     int max_vals_per_row,
                                                     bool include_validity)
 {
   std::vector<cudf::size_type> row_sizes(num_rows);
 
-  constexpr auto seed           = 21337;
   auto const min_values_per_row = include_validity ? 0 : 1;
-  std::mt19937 engine{seed};
   std::uniform_int_distribution<cudf::size_type> dist{min_values_per_row, max_vals_per_row};
   std::generate_n(row_sizes.begin(), num_rows, [&]() { return cudf::size_type{dist(engine)}; });
 
@@ -7121,7 +7112,7 @@ std::unique_ptr<cudf::column> make_parquet_list_col(int num_rows,
                                                                       offsets.end());
 
   if (include_validity) {
-    auto valids = random_validity();
+    auto valids = random_validity(engine);
     auto values_col =
       cudf::test::fixed_width_column_wrapper<T>(values.begin(), values.end(), valids);
     auto [null_mask, null_count] = cudf::test::detail::make_null_mask(valids, valids + num_rows);
@@ -7139,11 +7130,8 @@ std::unique_ptr<cudf::column> make_parquet_list_col(int num_rows,
   }
 }
 
-std::vector<std::string> string_values(int num_rows, int max_string_len)
+std::vector<std::string> string_values(std::mt19937& engine, int num_rows, int max_string_len)
 {
-  constexpr auto seed = 21337;
-
-  static std::mt19937 engine{seed};
   static std::uniform_int_distribution<char> char_dist{'a', 'z'};
   static std::uniform_int_distribution<cudf::size_type> strlen_dist{1, max_string_len};
 
@@ -7162,13 +7150,12 @@ std::vector<std::string> string_values(int num_rows, int max_string_len)
 
 // make a random list<string> column, with random string lengths of 0..max_string_len,
 // and up to max_vals_per_row strings in each list.
-std::unique_ptr<cudf::column> make_parquet_string_list_col(int num_rows,
+std::unique_ptr<cudf::column> make_parquet_string_list_col(std::mt19937& engine,
+                                                           int num_rows,
                                                            int max_vals_per_row,
                                                            int max_string_len,
                                                            bool include_validity)
 {
-  constexpr auto seed = 21337;
-  static std::mt19937 engine{seed};
   auto const range_min = include_validity ? 0 : 1;
 
   std::uniform_int_distribution<cudf::size_type> dist{range_min, max_vals_per_row};
@@ -7181,13 +7168,13 @@ std::unique_ptr<cudf::column> make_parquet_string_list_col(int num_rows,
   offsets[num_rows] = offsets[num_rows - 1] + row_sizes.back();
 
   std::uniform_int_distribution<cudf::size_type> strlen_dist{range_min, max_string_len};
-  auto const values = string_values(offsets[num_rows], max_string_len);
+  auto const values = string_values(engine, offsets[num_rows], max_string_len);
 
   cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets_col(offsets.begin(),
                                                                       offsets.end());
 
   if (include_validity) {
-    auto valids     = random_validity();
+    auto valids     = random_validity(engine);
     auto values_col = cudf::test::strings_column_wrapper(values.begin(), values.end(), valids);
     auto [null_mask, null_count] = cudf::test::detail::make_null_mask(valids, valids + num_rows);
 
@@ -7207,28 +7194,31 @@ std::unique_ptr<cudf::column> make_parquet_string_list_col(int num_rows,
 TEST_F(ParquetReaderTest, DeltaSkipRowsWithNulls)
 {
   constexpr int num_rows = 50'000;
-  auto int32_list_nulls  = make_parquet_list_col<int32_t>(num_rows, 5, true);
-  auto int32_list        = make_parquet_list_col<int32_t>(num_rows, 5, false);
-  auto int64_list_nulls  = make_parquet_list_col<int64_t>(num_rows, 5, true);
-  auto int64_list        = make_parquet_list_col<int64_t>(num_rows, 5, false);
-  auto int16_list_nulls  = make_parquet_list_col<int16_t>(num_rows, 5, true);
-  auto int16_list        = make_parquet_list_col<int16_t>(num_rows, 5, false);
-  auto int8_list_nulls   = make_parquet_list_col<int8_t>(num_rows, 5, true);
-  auto int8_list         = make_parquet_list_col<int8_t>(num_rows, 5, false);
+  constexpr auto seed    = 21337;
 
-  auto str_list_nulls     = make_parquet_string_list_col(num_rows, 5, 32, true);
-  auto str_list           = make_parquet_string_list_col(num_rows, 5, 32, false);
-  auto big_str_list_nulls = make_parquet_string_list_col(num_rows, 5, 256, true);
-  auto big_str_list       = make_parquet_string_list_col(num_rows, 5, 256, false);
+  std::mt19937 engine{seed};
+  auto int32_list_nulls = make_parquet_list_col<int32_t>(engine, num_rows, 5, true);
+  auto int32_list       = make_parquet_list_col<int32_t>(engine, num_rows, 5, false);
+  auto int64_list_nulls = make_parquet_list_col<int64_t>(engine, num_rows, 5, true);
+  auto int64_list       = make_parquet_list_col<int64_t>(engine, num_rows, 5, false);
+  auto int16_list_nulls = make_parquet_list_col<int16_t>(engine, num_rows, 5, true);
+  auto int16_list       = make_parquet_list_col<int16_t>(engine, num_rows, 5, false);
+  auto int8_list_nulls  = make_parquet_list_col<int8_t>(engine, num_rows, 5, true);
+  auto int8_list        = make_parquet_list_col<int8_t>(engine, num_rows, 5, false);
+
+  auto str_list_nulls     = make_parquet_string_list_col(engine, num_rows, 5, 32, true);
+  auto str_list           = make_parquet_string_list_col(engine, num_rows, 5, 32, false);
+  auto big_str_list_nulls = make_parquet_string_list_col(engine, num_rows, 5, 256, true);
+  auto big_str_list       = make_parquet_string_list_col(engine, num_rows, 5, 256, false);
 
   auto int32_data   = random_values<int32_t>(num_rows);
   auto int64_data   = random_values<int64_t>(num_rows);
   auto int16_data   = random_values<int16_t>(num_rows);
   auto int8_data    = random_values<int8_t>(num_rows);
-  auto str_data     = string_values(num_rows, 32);
-  auto big_str_data = string_values(num_rows, 256);
+  auto str_data     = string_values(engine, num_rows, 32);
+  auto big_str_data = string_values(engine, num_rows, 256);
 
-  auto const validity = random_validity();
+  auto const validity = random_validity(engine);
   auto const no_nulls = cudf::test::iterators::no_nulls();
   column_wrapper<int32_t> int32_nulls_col{int32_data.begin(), int32_data.end(), validity};
   column_wrapper<int32_t> int32_col{int32_data.begin(), int32_data.end(), no_nulls};
