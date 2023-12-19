@@ -468,7 +468,10 @@ __global__ void __launch_bounds__(128)
   }
 }
 
-__device__ size_t delta_data_len(Type physical_type, cudf::type_id type_id, uint32_t num_values)
+__device__ size_t delta_data_len(Type physical_type,
+                                 cudf::type_id type_id,
+                                 uint32_t num_values,
+                                 size_t page_size)
 {
   auto const dtype_len_out = physical_type_len(physical_type, type_id);
   auto const dtype_len     = [&]() -> uint32_t {
@@ -495,7 +498,15 @@ __device__ size_t delta_data_len(Type physical_type, cudf::type_id type_id, uint
   // modified.
   auto const header_size = 2 + 1 + 5 + dtype_len + 1;
 
-  return header_size + num_blocks * block_size;
+  // The above is just a size estimate for a DELTA_BINARY_PACKED data page. For BYTE_ARRAY
+  // data we also need to add size of the char data. `page_size` that is passed in is the
+  // plain encoded size (i.e. num_values * sizeof(size_type) + char_data_len), so the char
+  // data len is `page_size` minus the first term.
+  // TODO: this will need to change for DELTA_BYTE_ARRAY encoding
+  auto const char_data_len =
+    physical_type == BYTE_ARRAY ? page_size - num_values * sizeof(size_type) : 0;
+
+  return header_size + num_blocks * block_size + char_data_len;
 }
 
 // blockDim {128,1,1}
@@ -697,13 +708,8 @@ __global__ void __launch_bounds__(128)
           auto const rep_level_size = max_RLE_page_size(col_g.num_rep_level_bits(), values_in_page);
           // get a different bound if using delta encoding
           if (is_use_delta) {
-            auto delta_len = delta_data_len(physical_type, type_id, page_g.num_leaf_values);
-            // for byte array, delta_len will be just the length data. page_size is the plain
-            // encoded size (i.e. num_values * sizeof(size_type) + char_data_len), so add that
-            // to delta_len but subtract the first term.
-            if (physical_type == BYTE_ARRAY) {
-              delta_len += page_size - page_g.num_leaf_values * sizeof(size_type);
-            }
+            auto const delta_len =
+              delta_data_len(physical_type, type_id, page_g.num_leaf_values, page_size);
             page_size = max(page_size, delta_len);
           }
           auto const max_data_size = page_size + def_level_size + rep_level_size + rle_pad;
@@ -2020,6 +2026,8 @@ __global__ void __launch_bounds__(block_size, 8)
   }
   __syncthreads();
 
+  auto const type_id = s->col.leaf_column->type().id();
+
   // encode the lengths as DELTA_BINARY_PACKED
   if (t == 0) {
     first_string = nullptr;
@@ -2030,9 +2038,13 @@ __global__ void __launch_bounds__(block_size, 8)
       for (uint32_t idx = 0; idx < s->page.num_leaf_values; idx++) {
         size_type const idx_in_col = s->page_start_val + idx;
         if (s->col.leaf_column->is_valid(idx_in_col)) {
-          // TODO: do we need to account for list(uint8) vs string?
-          first_string = reinterpret_cast<uint8_t const*>(
-            s->col.leaf_column->element<string_view>(idx_in_col).data());
+          if (type_id == type_id::STRING) {
+            first_string = reinterpret_cast<uint8_t const*>(
+              s->col.leaf_column->element<string_view>(idx_in_col).data());
+          } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+            first_string = reinterpret_cast<uint8_t const*>(
+              get_element<statistics::byte_array_view>(*s->col.leaf_column, idx_in_col).data());
+          }
           break;
         }
       }
@@ -2054,13 +2066,25 @@ __global__ void __launch_bounds__(block_size, 8)
 
     cur_val_idx += nvals;
 
-    int32_t v = is_valid ? s->col.leaf_column->element<string_view>(val_idx).size_bytes() : 0;
-    len += v;
+    int32_t v = 0;
+    if (is_valid) {
+      if (type_id == type_id::STRING) {
+        v = s->col.leaf_column->element<string_view>(val_idx).size_bytes();
+      } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+        auto const arr_size =
+          get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx).size_bytes();
+        // the lengths are assumed to be INT32, check for overflow
+        if (arr_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+          CUDF_UNREACHABLE("byte array size exceeds 2GB");
+        }
+        v = static_cast<int32_t>(arr_size);
+      }
+      len += v;
+    }
 
     packer.add_value(v, is_valid);
   }
 
-  // TODO: test for overflow (string_len > 2GB)
   // string_len is only valid on thread 0
   auto const string_len = block_reduce(temp_storage.reduce_storage).Sum(len);
   if (t == 0) { string_data_len = string_len; }
@@ -2073,7 +2097,7 @@ __global__ void __launch_bounds__(block_size, 8)
   memcpy_block<block_size, true>(output_ptr, first_string, string_data_len, t);
 
   finish_page_encode<block_size>(
-    s, output_ptr + string_len, pages, comp_in, comp_out, comp_results, true);
+    s, output_ptr + string_data_len, pages, comp_in, comp_out, comp_results, true);
 }
 
 constexpr int decide_compression_warps_in_block = 4;

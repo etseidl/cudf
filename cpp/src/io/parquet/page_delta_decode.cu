@@ -329,9 +329,13 @@ __global__ void __launch_bounds__(96)
   auto* const db        = &db_state;
   [[maybe_unused]] null_count_back_copier _{s, t};
 
-  auto const mask = decode_kernel_mask::DELTA_BINARY;
-  if (!setupLocalPageInfo(
-        s, &pages[page_idx], chunks, min_row, num_rows, mask_filter{mask}, true)) {
+  if (!setupLocalPageInfo(s,
+                          &pages[page_idx],
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::DELTA_BINARY},
+                          page_processing_stage::DECODE)) {
     return;
   }
 
@@ -452,9 +456,13 @@ __global__ void __launch_bounds__(decode_block_size)
   auto* const dba       = &db_state;
   [[maybe_unused]] null_count_back_copier _{s, t};
 
-  auto const mask = decode_kernel_mask::DELTA_BYTE_ARRAY;
-  if (!setupLocalPageInfo(
-        s, &pages[page_idx], chunks, min_row, num_rows, mask_filter{mask}, true)) {
+  if (!setupLocalPageInfo(s,
+                          &pages[page_idx],
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::DELTA_BYTE_ARRAY},
+                          page_processing_stage::DECODE)) {
     return;
   }
 
@@ -604,8 +612,13 @@ __global__ void __launch_bounds__(decode_block_size)
   [[maybe_unused]] null_count_back_copier _{s, t};
 
   auto const mask = decode_kernel_mask::DELTA_LENGTH_BA;
-  if (!setupLocalPageInfo(
-        s, &pages[page_idx], chunks, min_row, num_rows, mask_filter{mask}, true)) {
+  if (!setupLocalPageInfo(s,
+                          &pages[page_idx],
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{mask},
+                          page_processing_stage::DECODE)) {
     return;
   }
 
@@ -794,8 +807,8 @@ void DecodeDeltaLengthByteArray(cudf::detail::hostdevice_vector<PageInfo>& pages
 {
   CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
 
-  dim3 dim_block(decode_block_size, 1);
-  dim3 dim_grid(pages.size(), 1);  // 1 threadblock per page
+  dim3 const dim_block(decode_block_size, 1);
+  dim3 const dim_grid(pages.size(), 1);  // 1 threadblock per page
 
   if (level_type_size == 1) {
     gpuDecodeDeltaLengthByteArray<uint8_t><<<dim_grid, dim_block, 0, stream.value()>>>(

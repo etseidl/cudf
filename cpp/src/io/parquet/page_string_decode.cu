@@ -615,7 +615,13 @@ __global__ void __launch_bounds__(preprocess_block_size) gpuComputeStringPageBou
                                                                                       {rep_runs}};
 
   // setup page info
-  if (!setupLocalPageInfo(s, pp, chunks, min_row, num_rows, mask_filter{STRINGS_MASK}, true)) {
+  if (!setupLocalPageInfo(s,
+                          pp,
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{STRINGS_MASK},
+                          page_processing_stage::STRING_BOUNDS)) {
     return;
   }
 
@@ -660,8 +666,15 @@ __global__ void __launch_bounds__(delta_preproc_block_size) gpuComputeDeltaPageS
   bool const has_repetition = chunks[pp->chunk_idx].max_level[level_type::REPETITION] > 0;
 
   // setup page info
-  auto const mask = decode_kernel_mask::DELTA_BYTE_ARRAY;
-  if (!setupLocalPageInfo(s, pp, chunks, min_row, num_rows, mask_filter{mask}, true)) { return; }
+  if (!setupLocalPageInfo(s,
+                          pp,
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::DELTA_BYTE_ARRAY},
+                          page_processing_stage::STRING_BOUNDS)) {
+    return;
+  }
 
   auto const start_value = pp->start_val;
 
@@ -689,7 +702,6 @@ __global__ void __launch_bounds__(delta_preproc_block_size) gpuComputeDeltaPageS
     auto const [len, temp_bytes] = totalDeltaByteArraySize(data, end, start_value, end_value);
 
     if (t == 0) {
-      // TODO check for overflow
       pp->str_bytes = len;
 
       // only need temp space if we're skipping values
@@ -730,8 +742,13 @@ __global__ void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLength
   bool const has_repetition = chunks[pp->chunk_idx].max_level[level_type::REPETITION] > 0;
 
   // setup page info
-  if (!setupLocalPageInfo(
-        s, pp, chunks, min_row, num_rows, mask_filter{decode_kernel_mask::DELTA_LENGTH_BA}, true)) {
+  if (!setupLocalPageInfo(s,
+                          pp,
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::DELTA_LENGTH_BA},
+                          page_processing_stage::STRING_BOUNDS)) {
     return;
   }
 
@@ -744,9 +761,7 @@ __global__ void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLength
     if (t == 0) {
       auto const* string_start = string_lengths.find_end_of_block(s->data_start, s->data_end);
       size_t len               = static_cast<size_t>(s->data_end - string_start);
-      // TODO check for overflow
-      pp->str_bytes = len;
-      __threadfence_block();
+      pp->str_bytes            = len;
     }
   } else {
     // now process string info in the range [start_value, end_value)
@@ -759,8 +774,10 @@ __global__ void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLength
 
     size_t total_bytes = 0;
 
-    // initialize with first value
-    if (t == 0 && start_value == 0) { total_bytes = string_lengths.value_at(0); }
+    // initialize with first value (unless there are no values)
+    if (t == 0 && start_value == 0 && start_value < end_value) {
+      total_bytes = string_lengths.value_at(0);
+    }
 
     auto const num_values = string_lengths.num_encoded_values(true);
     uleb128_t lane_sum    = 0;
@@ -788,7 +805,6 @@ __global__ void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLength
     if (t == 0) {
       total_bytes += warp_sum;
       pp->str_bytes = total_bytes;
-      __threadfence_block();
     }
   }
 }
@@ -818,8 +834,13 @@ __global__ void __launch_bounds__(preprocess_block_size) gpuComputePageStringSiz
   bool const has_repetition = chunks[pp->chunk_idx].max_level[level_type::REPETITION] > 0;
 
   // setup page info
-  if (!setupLocalPageInfo(
-        s, pp, chunks, min_row, num_rows, mask_filter{decode_kernel_mask::STRING}, true)) {
+  if (!setupLocalPageInfo(s,
+                          pp,
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::STRING},
+                          page_processing_stage::STRING_BOUNDS)) {
     return;
   }
 
@@ -912,9 +933,13 @@ __global__ void __launch_bounds__(decode_block_size)
   int const lane_id     = t % warp_size;
   [[maybe_unused]] null_count_back_copier _{s, t};
 
-  auto const mask = decode_kernel_mask::STRING;
-  if (!setupLocalPageInfo(
-        s, &pages[page_idx], chunks, min_row, num_rows, mask_filter{mask}, true)) {
+  if (!setupLocalPageInfo(s,
+                          &pages[page_idx],
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::STRING},
+                          page_processing_stage::DECODE)) {
     return;
   }
 
