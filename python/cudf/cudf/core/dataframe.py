@@ -1,4 +1,4 @@
-# Copyright (c) 2018-2023, NVIDIA CORPORATION.
+# Copyright (c) 2018-2024, NVIDIA CORPORATION.
 
 from __future__ import annotations
 
@@ -19,11 +19,13 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     MutableMapping,
     Optional,
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 import cupy
@@ -324,7 +326,7 @@ class _DataFrameLocIndexer(_DataFrameIndexer):
                     tmp_arg[1],
                 )
 
-                if is_bool_dtype(tmp_arg[0]):
+                if is_bool_dtype(tmp_arg[0].dtype):
                     df = columns_df._apply_boolean_mask(
                         BooleanMask(tmp_arg[0], len(columns_df))
                     )
@@ -341,10 +343,16 @@ class _DataFrameLocIndexer(_DataFrameIndexer):
                         tmp_col_name = (tmp_col_name, *extra)
                         cantor_name = (cantor_name, *extra)
                     other_df = DataFrame(
-                        {tmp_col_name: column.arange(len(tmp_arg[0]))},
+                        {
+                            tmp_col_name: column.as_column(
+                                range(len(tmp_arg[0]))
+                            )
+                        },
                         index=as_index(tmp_arg[0]),
                     )
-                    columns_df[cantor_name] = column.arange(len(columns_df))
+                    columns_df[cantor_name] = column.as_column(
+                        range(len(columns_df))
+                    )
                     df = other_df.join(columns_df, how="inner")
                     # as join is not assigning any names to index,
                     # update it over here
@@ -1767,7 +1775,12 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
 
         return out
 
-    def astype(self, dtype, copy=False, errors="raise", **kwargs):
+    def astype(
+        self,
+        dtype,
+        copy: bool = False,
+        errors: Literal["raise", "ignore"] = "raise",
+    ):
         if is_dict_like(dtype):
             if len(set(dtype.keys()) - set(self._data.names)) > 0:
                 raise KeyError(
@@ -1776,7 +1789,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
                 )
         else:
             dtype = {cc: dtype for cc in self._data.names}
-        return super().astype(dtype, copy, errors, **kwargs)
+        return super().astype(dtype, copy, errors)
 
     def _clean_renderable_dataframe(self, output):
         """
@@ -1986,8 +1999,6 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
         fill_value: Any = None,
         reflect: bool = False,
         can_reindex: bool = False,
-        *args,
-        **kwargs,
     ) -> Tuple[
         Union[
             Dict[Optional[str], Tuple[ColumnBase, Any, bool, Any]],
@@ -2338,7 +2349,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
 
     @_cudf_nvtx_annotate
     def scatter_by_map(
-        self, map_index, map_size=None, keep_index=True, **kwargs
+        self, map_index, map_size=None, keep_index=True, debug: bool = False
     ):
         """Scatter to a list of dataframes.
 
@@ -2379,21 +2390,23 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
 
         # Convert string or categorical to integer
         if isinstance(map_index, cudf.core.column.StringColumn):
-            map_index = map_index.as_categorical_column(
-                "category"
-            ).as_numerical
+            cat_index = cast(
+                cudf.core.column.CategoricalColumn,
+                map_index.as_categorical_column("category"),
+            )
+            map_index = cat_index.codes
             warnings.warn(
                 "Using StringColumn for map_index in scatter_by_map. "
                 "Use an integer array/column for better performance."
             )
         elif isinstance(map_index, cudf.core.column.CategoricalColumn):
-            map_index = map_index.as_numerical
+            map_index = map_index.codes
             warnings.warn(
                 "Using CategoricalColumn for map_index in scatter_by_map. "
                 "Use an integer array/column for better performance."
             )
 
-        if kwargs.get("debug", False) == 1 and map_size is not None:
+        if debug and map_size is not None:
             count = map_index.distinct_count()
             if map_size < count:
                 raise ValueError(
@@ -2408,7 +2421,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
         partitioned = self._from_columns_like_self(
             partitioned_columns,
             column_names=self._column_names,
-            index_names=self._index_names if keep_index else None,
+            index_names=list(self._index_names) if keep_index else None,
         )
 
         # due to the split limitation mentioned
@@ -2539,7 +2552,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
             yield (k, self[k])
 
     @_cudf_nvtx_annotate
-    def equals(self, other, **kwargs):
+    def equals(self, other):
         ret = super().equals(other)
         # If all other checks matched, validate names.
         if ret:
@@ -5999,9 +6012,14 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
         axis = self._get_axis_from_axis_arg(axis)
         if axis != 0:
             raise NotImplementedError("Only axis=0 is currently supported.")
-
+        length = len(self)
         return Series._from_data(
-            {None: [self._data[col].valid_count for col in self._data.names]},
+            {
+                None: [
+                    length - self._data[col].null_count
+                    for col in self._data.names
+                ]
+            },
             as_index(self._data.names),
         )
 
@@ -6029,7 +6047,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
             numeric_cols = (
                 name
                 for name in self._data.names
-                if is_numeric_dtype(self._data[name])
+                if is_numeric_dtype(self._data[name].dtype)
             )
             source = self._get_columns_by_label(numeric_cols)
             if source.empty:
@@ -6075,7 +6093,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
                     numeric_cols = (
                         name
                         for name in self._data.names
-                        if is_numeric_dtype(self._data[name])
+                        if is_numeric_dtype(self._data[name].dtype)
                     )
                     source = self._get_columns_by_label(numeric_cols)
                     if source.empty:
@@ -8093,7 +8111,7 @@ def _get_non_null_cols_and_dtypes(col_idxs, list_of_columns):
             # non-null Column with the same name is found.
             if idx not in dtypes:
                 dtypes[idx] = cols[idx].dtype
-            if cols[idx].valid_count > 0:
+            if cols[idx].null_count != len(cols[idx]):
                 if idx not in non_null_columns:
                     non_null_columns[idx] = [cols[idx]]
                 else:
