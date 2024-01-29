@@ -339,7 +339,7 @@ class delta_binary_decoder {
     while (_current_value_idx < skip && _current_value_idx < num_encoded_values(true)) {
       calc_mini_block_values(t);
 
-      int const idx = current_value_idx + t;
+      int const idx = _current_value_idx + t;
 
       for (uint32_t p = 0; p < num_pass; p++) {
         auto const pidx     = idx + p * warp_size;
