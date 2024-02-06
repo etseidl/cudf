@@ -6609,6 +6609,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
         return_metadata=False,
         use_dictionary=True,
         header_version="1.0",
+        prefer_delta_byte_array=False,
         *args,
         **kwargs,
     ):
@@ -6635,6 +6636,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
             return_metadata=return_metadata,
             use_dictionary=use_dictionary,
             header_version=header_version,
+            prefer_delta_byte_array=prefer_delta_byte_array,
             *args,
             **kwargs,
         )

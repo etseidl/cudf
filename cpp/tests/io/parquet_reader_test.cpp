@@ -2001,17 +2001,6 @@ TEST_F(ParquetReaderTest, DeltaSkipRowsWithNulls)
                         str_col,     *str_col_nulls,     *str_list,     *str_list_nulls,
                         big_str_col, *big_str_col_nulls, *big_str_list, *big_str_list_nulls});
 
-  auto const filepath = temp_env->get_temp_filepath("DeltaSkipRowsWithNulls.parquet");
-  auto const out_opts =
-    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, tbl)
-      .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
-      .compression(cudf::io::compression_type::NONE)
-      .dictionary_policy(cudf::io::dictionary_policy::NEVER)
-      .max_page_size_rows(5'000)
-      .write_v2_headers(true)
-      .build();
-  cudf::io::write_parquet(out_opts);
-
   // skip_rows / num_rows
   // clang-format off
   std::vector<std::pair<int, int>> params{
@@ -2026,38 +2015,86 @@ TEST_F(ParquetReaderTest, DeltaSkipRowsWithNulls)
   };
 
   // clang-format on
-  for (auto p : params) {
-    cudf::io::parquet_reader_options read_args =
-      cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
-    if (p.first >= 0) { read_args.set_skip_rows(p.first); }
-    if (p.second >= 0) { read_args.set_num_rows(p.second); }
-    auto result = cudf::io::read_parquet(read_args);
-
-    p.first  = p.first < 0 ? 0 : p.first;
-    p.second = p.second < 0 ? num_rows - p.first : p.second;
-    std::vector<cudf::size_type> slice_indices{p.first, p.first + p.second};
-    std::vector<cudf::table_view> expected = cudf::slice(tbl, slice_indices);
-
-    CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), expected[0]);
-
-    // test writing the result back out as a further check of the delta writer's correctness
-    std::vector<char> out_buffer;
-    cudf::io::parquet_writer_options out_opts2 =
-      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&out_buffer},
-                                                result.tbl->view())
+  auto const do_test = [&](bool prefer_dba) {
+    auto const filepath = temp_env->get_temp_filepath("DeltaSkipRowsWithNulls.parquet");
+    auto const out_opts =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, tbl)
         .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
         .compression(cudf::io::compression_type::NONE)
         .dictionary_policy(cudf::io::dictionary_policy::NEVER)
         .max_page_size_rows(5'000)
-        .write_v2_headers(true);
-    cudf::io::write_parquet(out_opts2);
+        .write_v2_headers(true)
+        .prefer_dba(prefer_dba)
+        .build();
+    cudf::io::write_parquet(out_opts);
 
-    cudf::io::parquet_reader_options default_in_opts = cudf::io::parquet_reader_options::builder(
-      cudf::io::source_info{out_buffer.data(), out_buffer.size()});
-    auto const result2 = cudf::io::read_parquet(default_in_opts);
+    for (auto p : params) {
+      cudf::io::parquet_reader_options read_args =
+        cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath});
+      if (p.first >= 0) { read_args.set_skip_rows(p.first); }
+      if (p.second >= 0) { read_args.set_num_rows(p.second); }
+      auto result = cudf::io::read_parquet(read_args);
 
-    CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), result2.tbl->view());
-  }
+      p.first  = p.first < 0 ? 0 : p.first;
+      p.second = p.second < 0 ? num_rows - p.first : p.second;
+      std::vector<cudf::size_type> slice_indices{p.first, p.first + p.second};
+      std::vector<cudf::table_view> expected = cudf::slice(tbl, slice_indices);
+
+      CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), expected[0]);
+
+      // test writing the result back out as a further check of the delta writer's correctness
+      std::vector<char> out_buffer;
+      cudf::io::parquet_writer_options out_opts2 =
+        cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&out_buffer},
+                                                  result.tbl->view())
+          .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+          .compression(cudf::io::compression_type::NONE)
+          .dictionary_policy(cudf::io::dictionary_policy::NEVER)
+          .max_page_size_rows(5'000)
+          .prefer_dba(prefer_dba)
+          .write_v2_headers(true);
+      cudf::io::write_parquet(out_opts2);
+
+      cudf::io::parquet_reader_options default_in_opts = cudf::io::parquet_reader_options::builder(
+        cudf::io::source_info{out_buffer.data(), out_buffer.size()});
+      auto const result2 = cudf::io::read_parquet(default_in_opts);
+
+      CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), result2.tbl->view());
+    }
+  };
+
+  do_test(false);
+  do_test(true);
+}
+
+TEST_F(ParquetReaderTest, DeltaByteArraySkipAllValid)
+{
+  // test that the DELTA_BYTE_ARRAY decoder can handle the case where skip rows skips all valid
+  // values in a page
+  constexpr int num_rows  = 500;
+  constexpr int num_valid = 150;
+
+  auto const ones = thrust::make_constant_iterator("one");
+
+  auto valids = cudf::detail::make_counting_transform_iterator(
+    0, [num_valid](auto i) { return i < num_valid; });
+  auto const col      = cudf::test::strings_column_wrapper{ones, ones + num_rows, valids};
+  auto const expected = table_view({col});
+
+  auto const filepath = temp_env->get_temp_filepath("DeltaByteArraySkipAllValid.parquet");
+  cudf::io::parquet_writer_options out_opts =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, expected)
+      .write_v2_headers(true)
+      .prefer_dba(true)
+      .dictionary_policy(cudf::io::dictionary_policy::NEVER);
+  cudf::io::write_parquet(out_opts);
+
+  cudf::io::parquet_reader_options in_opts =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+      .skip_rows(num_valid + 1);
+  auto result = cudf::io::read_parquet(in_opts);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::slice(expected, {num_valid + 1, num_rows}),
+                                result.tbl->view());
 }
 
 // test that using page stats is working for full reads and various skip rows
