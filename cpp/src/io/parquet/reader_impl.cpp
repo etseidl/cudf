@@ -212,8 +212,7 @@ void reader::impl::decode_page_data(bool uses_custom_row_bounds, size_t skip_row
   // launch string decoder
   int s_idx = 0;
   if (BitAnd(kernel_mask, decode_kernel_mask::STRING) != 0 or
-      BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_PLAIN) or
-      BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_DICT)) {
+      BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_PLAIN)) {
     DecodeStringPageData(subpass.pages,
                          pass.chunks,
                          num_rows,
@@ -221,6 +220,16 @@ void reader::impl::decode_page_data(bool uses_custom_row_bounds, size_t skip_row
                          level_type_size,
                          error_code.data(),
                          streams[s_idx++]);
+  }
+
+  if (BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_DICT)) {
+    DecodeStringPageDataFlatDict(subpass.pages,
+                                 pass.chunks,
+                                 num_rows,
+                                 skip_rows,
+                                 level_type_size,
+                                 error_code.data(),
+                                 streams[s_idx++]);
   }
 
   // launch delta byte array decoder

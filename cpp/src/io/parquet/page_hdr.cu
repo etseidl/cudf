@@ -175,12 +175,7 @@ __device__ decode_kernel_mask kernel_mask_for_page(PageInfo const& page,
     return decode_kernel_mask::DELTA_LENGTH_BA;
   } else if (is_string_col(chunk)) {
     // check for string before byte_stream_split so FLBA will go to the right kernel
-    return decode_kernel_mask::STRING;
-  }
-
-  // check for micro kernels
-  if (!is_nested(chunk) && !is_boolean(chunk)) {
-    if (is_byte_array(chunk)) {
+    if (!is_nested(chunk)) {
       if (page.encoding == Encoding::PLAIN) {
         return decode_kernel_mask::STRING_FLAT_PLAIN;
       } else if (page.encoding == Encoding::PLAIN_DICTIONARY ||
@@ -188,14 +183,19 @@ __device__ decode_kernel_mask kernel_mask_for_page(PageInfo const& page,
         return decode_kernel_mask::STRING_FLAT_DICT;
       }
     } else {
-      if (page.encoding == Encoding::PLAIN) {
-        return decode_kernel_mask::FIXED_WIDTH_NO_DICT;
-      } else if (page.encoding == Encoding::PLAIN_DICTIONARY ||
-                 page.encoding == Encoding::RLE_DICTIONARY) {
-        return decode_kernel_mask::FIXED_WIDTH_DICT;
-      } else if (page.encoding == Encoding::BYTE_STREAM_SPLIT) {
-        return decode_kernel_mask::BYTE_STREAM_SPLIT_FLAT;
-      }
+      return decode_kernel_mask::STRING;
+    }
+  }
+
+  // check for micro kernels
+  if (!is_nested(chunk) && !is_byte_array(chunk) && !is_boolean(chunk)) {
+    if (page.encoding == Encoding::PLAIN) {
+      return decode_kernel_mask::FIXED_WIDTH_NO_DICT;
+    } else if (page.encoding == Encoding::PLAIN_DICTIONARY ||
+               page.encoding == Encoding::RLE_DICTIONARY) {
+      return decode_kernel_mask::FIXED_WIDTH_DICT;
+    } else if (page.encoding == Encoding::BYTE_STREAM_SPLIT) {
+      return decode_kernel_mask::BYTE_STREAM_SPLIT_FLAT;
     }
   }
 
