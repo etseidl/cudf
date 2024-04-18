@@ -18,6 +18,7 @@
 #include "error.hpp"
 #include "page_decode.cuh"
 #include "page_string_utils.cuh"
+#include "parquet_gpu.hpp"
 #include "rle_stream.cuh"
 
 #include <cudf/detail/utilities/cuda.cuh>
@@ -844,9 +845,14 @@ CUDF_KERNEL void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLengt
  * @param chunks All chunks to be decoded
  * @param min_rows crop all rows below min_row
  * @param num_rows Maximum number of rows to read
+ * @param kernel_mask `decode_kernel_mask` to filter on
  */
-CUDF_KERNEL void __launch_bounds__(preprocess_block_size) gpuComputePageStringSizes(
-  PageInfo* pages, device_span<ColumnChunkDesc const> chunks, size_t min_row, size_t num_rows)
+CUDF_KERNEL void __launch_bounds__(preprocess_block_size)
+  gpuComputePageStringSizes(PageInfo* pages,
+                            device_span<ColumnChunkDesc const> chunks,
+                            size_t min_row,
+                            size_t num_rows,
+                            decode_kernel_mask kernel_mask)
 {
   __shared__ __align__(16) page_state_s state_g;
 
@@ -864,7 +870,7 @@ CUDF_KERNEL void __launch_bounds__(preprocess_block_size) gpuComputePageStringSi
                           chunks,
                           min_row,
                           num_rows,
-                          mask_filter{decode_kernel_mask::STRING},
+                          mask_filter{kernel_mask},
                           page_processing_stage::STRING_BOUNDS)) {
     return;
   }
@@ -967,12 +973,17 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   int const lane_id     = t % warp_size;
   [[maybe_unused]] null_count_back_copier _{s, t};
 
+  // FIXME: remove when done implementing new kernels
+  auto const kernel_mask = static_cast<uint32_t>(decode_kernel_mask::STRING) |
+                           static_cast<uint32_t>(decode_kernel_mask::STRING_FLAT_DICT) |
+                           static_cast<uint32_t>(decode_kernel_mask::STRING_FLAT_DICT);
   if (!setupLocalPageInfo(s,
                           &pages[page_idx],
                           chunks,
                           min_row,
                           num_rows,
-                          mask_filter{decode_kernel_mask::STRING},
+                          // mask_filter{decode_kernel_mask::STRING},
+                          mask_filter{kernel_mask},
                           page_processing_stage::DECODE)) {
     return;
   }
@@ -1187,7 +1198,15 @@ void ComputePageStringSizes(cudf::detail::hostdevice_span<PageInfo> pages,
   }
   if (BitAnd(kernel_mask, decode_kernel_mask::STRING) != 0) {
     gpuComputePageStringSizes<<<dim_grid, dim_block, 0, streams[s_idx++].value()>>>(
-      pages.device_ptr(), chunks, min_row, num_rows);
+      pages.device_ptr(), chunks, min_row, num_rows, decode_kernel_mask::STRING);
+  }
+  if (BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_PLAIN) != 0) {
+    gpuComputePageStringSizes<<<dim_grid, dim_block, 0, streams[s_idx++].value()>>>(
+      pages.device_ptr(), chunks, min_row, num_rows, decode_kernel_mask::STRING_FLAT_PLAIN);
+  }
+  if (BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_DICT) != 0) {
+    gpuComputePageStringSizes<<<dim_grid, dim_block, 0, streams[s_idx++].value()>>>(
+      pages.device_ptr(), chunks, min_row, num_rows, decode_kernel_mask::STRING_FLAT_DICT);
   }
 
   // synchronize the streams

@@ -221,9 +221,12 @@ enum class decode_kernel_mask {
 };
 
 // mask representing all the ways in which a string can be encoded
-constexpr uint32_t STRINGS_MASK =
-  BitOr(BitOr(decode_kernel_mask::DELTA_BYTE_ARRAY, decode_kernel_mask::STRING),
-        decode_kernel_mask::DELTA_LENGTH_BA);
+constexpr uint32_t STRINGS_MASK = static_cast<uint32_t>(decode_kernel_mask::STRING) |
+                                  static_cast<uint32_t>(decode_kernel_mask::DELTA_BYTE_ARRAY) |
+                                  static_cast<uint32_t>(decode_kernel_mask::DELTA_LENGTH_BA) |
+                                  static_cast<uint32_t>(decode_kernel_mask::STRING_FLAT_PLAIN) |
+                                  static_cast<uint32_t>(decode_kernel_mask::STRING_FLAT_DICT);
+
 /**
  * @brief Nesting information specifically needed by the decode and preprocessing
  * kernels.
