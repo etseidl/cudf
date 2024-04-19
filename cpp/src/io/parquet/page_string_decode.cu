@@ -788,7 +788,7 @@ CUDF_KERNEL void __launch_bounds__(delta_length_block_size) gpuComputeDeltaLengt
   if (not is_bounds_pg) {
     if (t == 0) {
       auto const* string_start = string_lengths.find_end_of_block(s->data_start, s->data_end);
-      size_t len               = static_cast<size_t>(s->data_end - string_start);
+      auto const len           = static_cast<size_t>(s->data_end - string_start);
       pp->str_bytes            = len;
     }
   } else {
@@ -1152,6 +1152,7 @@ struct page_tform_functor {
   }
 };
 
+template <typename state_buf>
 __device__ size_type gpuDecodeStringValues(
   page_state_s* s, state_buf* const sb, int start, int end, size_type starting_offset)
 {
@@ -1180,15 +1181,14 @@ __device__ size_type gpuDecodeStringValues(
 
   int pos = start;
   while (pos < end) {
-    int const batch_size = min(max_batch_size, next_valid_count - pos);
-
+    int const batch_size = min(max_batch_size, end - pos);
     int const target_pos = pos + batch_size;
     int const src_pos    = pos + t;
 
     // the position in the output column/buffer
     int dst_pos = sb->nz_idx[rolling_index<rolling_buf_size>(src_pos)] - s->first_row;
 
-    // gpuOutputGeneric(s, sb, src_pos, static_cast<uint8_t*>(dst), dtype_len);
+    // calculate per-warp offsets
     auto [ptr, len] = src_pos < target_pos && dst_pos >= 0
                         ? gpuGetStringData(s, sb, src_pos)
                         : cuda::std::pair<char const*, size_t>{nullptr, 0};
@@ -1196,6 +1196,7 @@ __device__ size_type gpuDecodeStringValues(
     size_type offset, warp_total;
     warp_scan(temp_storage[warp_id]).ExclusiveSum(len, offset, warp_total);
 
+    // and then translate to block-wide offsets
     if (lane_id == 0) { warp_offsets[warp_id] = warp_total; }
     __syncthreads();
     if (t == 0) {
@@ -1209,6 +1210,9 @@ __device__ size_type gpuDecodeStringValues(
     auto const use_char_ll = warp_total / warp_size >= warp_size;
 
     if (use_char_ll) {
+      // TODO rather than a matrix, just have a per-warp value, and then assign based on the
+      // value of `ss`. That should cut shared mem use alot, but at the expense of another
+      // syncwarp per iteration.
       offsets[warp_id][lane_id]  = offset;
       pointers[warp_id][lane_id] = reinterpret_cast<uint8_t const*>(ptr);
       dsts[warp_id][lane_id]     = dst_pos;
@@ -1270,20 +1274,15 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   using cudf::detail::warp_size;
   __shared__ __align__(16) page_state_s state_g;
   __shared__ __align__(16) page_state_buffers_s<rolling_buf_size,  // size of nz_idx buffer
-                                                1,                 // unused in this kernel
-                                                1>                 // unused in this kernel
+                                                rolling_buf_size,  // dictionary
+                                                rolling_buf_size>  // string lengths
     state_buffers;
-  __shared__ __align__(4) size_type last_offset;
 
   page_state_s* const s = &state_g;
   auto* const sb        = &state_buffers;
   int const page_idx    = blockIdx.x;
   int const t           = threadIdx.x;
-  int const lane_id     = t % warp_size;
-  int const warp_id     = t / warp_size;
   PageInfo* pp          = &pages[page_idx];
-
-  if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::STRING_FLAT_PLAIN))) { return; }
 
   // must come after the kernel mask check
   [[maybe_unused]] null_count_back_copier _{s, t};
@@ -1298,6 +1297,14 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     return;
   }
 
+  // nesting level that is storing actual leaf values
+  int const leaf_level_index               = s->col.max_nesting_depth - 1;
+  PageNestingDecodeInfo* nesting_info_base = s->nesting_info;
+
+  // the required number of runs in shared memory we will need to provide the
+  // rle_stream object
+  constexpr int rle_run_buffer_size = rle_stream_required_run_buffer_size<decode_block_size>();
+
   // the level stream decoders
   __shared__ rle_run<level_t> def_runs[rle_run_buffer_size];
   rle_stream<level_t, decode_block_size, rolling_buf_size> def_decoder{def_runs};
@@ -1309,7 +1316,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   bool const nullable_with_nulls = nullable && has_nulls(s);
 
   // initialize the stream decoders (requires values computed in setupLocalPageInfo)
-  level_t* const def = reinterpret_cast<level_t*>(pp->lvl_decode_buf[level_type::DEFINITION]);
+  auto const def = reinterpret_cast<level_t*>(pp->lvl_decode_buf[level_type::DEFINITION]);
   if (nullable_with_nulls) {
     def_decoder.init(s->col.level_bits[level_type::DEFINITION],
                      s->abs_lvl_start[level_type::DEFINITION],
@@ -1326,8 +1333,10 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   // - valid_count: number of non-null rows we have decoded so far. In each iteration of the
   //   loop below, we look at the number of valid items (which could be all for non-nullable),
   //   and valid_count is that running count.
-  int processed_count = 0;
-  int valid_count     = 0;
+  int processed_count     = 0;
+  int valid_count         = 0;
+  size_type string_offset = 0;
+
   // the core loop. decode batches of level stream data using rle_stream objects
   // and pass the results to gpuDecodeValues
   while (s->error == 0 && processed_count < s->page.num_input_values) {
@@ -1353,12 +1362,22 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     }
     __syncthreads();
 
+    gpuInitStringDescriptors<false>(s, sb, next_valid_count, t);
+    if (t == 0) { s->dict_pos = next_valid_count; }
+
     // decode the values themselves
-    gpuDecodeValues(s, sb, valid_count, next_valid_count, t);
+    string_offset = gpuDecodeStringValues(s, sb, valid_count, next_valid_count, string_offset);
     __syncthreads();
 
     valid_count = next_valid_count;
   }
+
+  // now turn array of lengths into offsets
+  int value_count = nesting_info_base[leaf_level_index].value_count - s->first_row;
+
+  auto const offptr = reinterpret_cast<size_type*>(nesting_info_base[leaf_level_index].data_out);
+  block_excl_sum<decode_block_size>(offptr, value_count, s->page.str_offset);
+
   if (t == 0 and s->error != 0) { set_error(s->error, error_code); }
 }
 
@@ -1388,17 +1407,12 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
                                                 rolling_buf_size,  // dictionary
                                                 1>                 // unused in this kernel
     state_buffers;
-  __shared__ __align__(4) size_type last_offset;
 
   page_state_s* const s = &state_g;
   auto* const sb        = &state_buffers;
   int const page_idx    = blockIdx.x;
   int const t           = threadIdx.x;
-  int const lane_id     = t % warp_size;
-  int const warp_id     = t / warp_size;
   PageInfo* pp          = &pages[page_idx];
-
-  if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::STRING_FLAT_DICT))) { return; }
 
   // must come after the kernel mask check
   [[maybe_unused]] null_count_back_copier _{s, t};
@@ -1443,9 +1457,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
                      s->page.num_input_values);
   }
 
-  // offsets are local to the page
-  if (t == 0) { last_offset = 0; }
-
   dict_stream.init(
     s->dict_bits, s->data_start, s->data_end, sb->dict_idx, s->page.num_input_values);
   __syncthreads();
@@ -1457,8 +1468,9 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   // - valid_count: number of non-null rows we have decoded so far. In each iteration of the
   //   loop below, we look at the number of valid items (which could be all for non-nullable),
   //   and valid_count is that running count.
-  int processed_count = 0;
-  int valid_count     = 0;
+  int processed_count     = 0;
+  int valid_count         = 0;
+  size_type string_offset = 0;
 
   // the core loop. decode batches of level stream data using rle_stream objects
   // and pass the results to gpuDecodeValues
@@ -1492,90 +1504,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     dict_stream.decode_next(t, next_valid_count - valid_count);
     __syncthreads();
 
-#if 1
-    auto const new_offset =
-      gpuDecodeStringValues(s, sb, valid_coount, next_valid_count, last_offset);
-    if (t == 0) { last_offset = new_offset; }
-#else
-    // FIXME: refactor once both string microkernels are done
-    // decode the values themselves
-    // gpuDecodeValues(s, sb, valid_count, next_valid_count, t);
-    constexpr int num_warps      = decode_block_size / warp_size;
-    constexpr int max_batch_size = num_warps * warp_size;
-
-    // decode values
-    int pos = valid_count;
-    while (pos < next_valid_count) {
-      int const batch_size = min(max_batch_size, next_valid_count - pos);
-
-      int const target_pos = pos + batch_size;
-      int const src_pos    = pos + t;
-
-      // the position in the output column/buffer
-      int dst_pos = sb->nz_idx[rolling_index<rolling_buf_size>(src_pos)] - s->first_row;
-
-      // gpuOutputGeneric(s, sb, src_pos, static_cast<uint8_t*>(dst), dtype_len);
-      auto [ptr, len] = src_pos < target_pos && dst_pos >= 0
-                          ? gpuGetStringData(s, sb, src_pos)
-                          : cuda::std::pair<char const*, size_t>{nullptr, 0};
-
-      __shared__ size_type warp_offsets[num_warps];
-      __shared__ cub::WarpScan<size_type>::TempStorage temp_storage;
-      size_type offset, warp_total;
-      cub::WarpScan<size_type>(temp_storage).ExclusiveSum(len, offset, warp_total);
-
-      if (lane_id == 0) { warp_offsets[warp_id] = warp_total; }
-      __syncthreads();
-      if (t == 0) {
-        auto const offsets_ptr = &warp_offsets[0];
-        thrust::exclusive_scan(thrust::seq, offsets_ptr, offsets_ptr + num_warps, warp_offsets);
-      }
-      __syncthreads();
-      offset += warp_offsets[warp_id] + last_offset;
-
-      // choose a character parallel string copy when the average string is longer than a warp
-      auto const use_char_ll = warp_total / warp_size >= warp_size;
-
-      if (use_char_ll) {
-        __shared__ __align__(8) uint8_t const* pointers[num_warps][warp_size];
-        __shared__ __align__(4) size_type offsets[num_warps][warp_size];
-        __shared__ __align__(4) int dsts[num_warps][warp_size];
-        __shared__ __align__(4) int lengths[num_warps][warp_size];
-
-        offsets[warp_id][lane_id]  = offset;
-        pointers[warp_id][lane_id] = reinterpret_cast<uint8_t const*>(ptr);
-        dsts[warp_id][lane_id]     = dst_pos;
-        lengths[warp_id][lane_id]  = len;
-        __syncwarp();
-
-        auto const warp_pos = warp_id * warp_size + pos;
-        for (int ss = 0; ss < warp_size && ss + warp_pos < target_pos; ss++) {
-          if (dsts[warp_id][ss] >= 0) {
-            auto offptr = reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) +
-                          dsts[warp_id][ss];
-            *offptr      = lengths[warp_id][ss];
-            auto str_ptr = nesting_info_base[leaf_level_index].string_out + offsets[warp_id][ss];
-            ll_strcpy(str_ptr, pointers[warp_id][ss], lengths[warp_id][ss], lane_id);
-          }
-        }
-
-      } else {
-        if (src_pos < target_pos && dst_pos >= 0) {
-          auto offptr =
-            reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
-          *offptr      = len;
-          auto str_ptr = nesting_info_base[leaf_level_index].string_out + offset;
-          memcpy(str_ptr, ptr, len);
-        }
-        __syncwarp();
-      }
-
-      // last thread in last warp updates last_offset
-      if (warp_id == num_warps - 1 && lane_id == warp_size - 1) { last_offset = offset + len; }
-
-      pos += batch_size;
-    }
-#endif
+    string_offset = gpuDecodeStringValues(s, sb, valid_count, next_valid_count, string_offset);
     __syncthreads();
 
     valid_count = next_valid_count;
