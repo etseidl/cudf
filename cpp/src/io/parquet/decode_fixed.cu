@@ -461,6 +461,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   int const t           = threadIdx.x;
   PageInfo* pp          = &pages[page_idx];
 
+  // FIXME: this shouldn't be here...the check is already in setupLocalPageInfo
   if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::BYTE_STREAM_SPLIT_FLAT))) {
     return;
   }

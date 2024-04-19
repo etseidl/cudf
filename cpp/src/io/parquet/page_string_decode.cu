@@ -974,16 +974,12 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   int const lane_id     = t % warp_size;
   [[maybe_unused]] null_count_back_copier _{s, t};
 
-  // FIXME: remove when done implementing new kernels
-  auto const kernel_mask = static_cast<uint32_t>(decode_kernel_mask::STRING) |
-                           static_cast<uint32_t>(decode_kernel_mask::STRING_FLAT_PLAIN);
   if (!setupLocalPageInfo(s,
                           &pages[page_idx],
                           chunks,
                           min_row,
                           num_rows,
-                          // mask_filter{decode_kernel_mask::STRING},
-                          mask_filter{kernel_mask},
+                          mask_filter{decode_kernel_mask::STRING},
                           page_processing_stage::DECODE)) {
     return;
   }
@@ -1156,6 +1152,216 @@ struct page_tform_functor {
   }
 };
 
+__device__ size_type gpuDecodeStringValues(
+  page_state_s* s, state_buf* const sb, int start, int end, size_type starting_offset)
+{
+  using cudf::detail::warp_size;
+  constexpr int num_warps      = decode_block_size / warp_size;
+  constexpr int max_batch_size = num_warps * warp_size;
+  using warp_scan              = cub::WarpScan<size_type>;
+  __shared__ warp_scan::TempStorage temp_storage[num_warps];
+  __shared__ size_type warp_offsets[num_warps];
+  __shared__ __align__(8) uint8_t const* pointers[num_warps][warp_size];
+  __shared__ __align__(4) size_type offsets[num_warps][warp_size];
+  __shared__ __align__(4) int dsts[num_warps][warp_size];
+  __shared__ __align__(4) int lengths[num_warps][warp_size];
+  __shared__ size_type last_offset;
+
+  int const t       = threadIdx.x;
+  int const lane_id = t % warp_size;
+  int const warp_id = t / warp_size;
+
+  // nesting level that is storing actual leaf values
+  int const leaf_level_index               = s->col.max_nesting_depth - 1;
+  PageNestingDecodeInfo* nesting_info_base = s->nesting_info;
+
+  if (t == 0) { last_offset = starting_offset; }
+  __syncthreads();
+
+  int pos = start;
+  while (pos < end) {
+    int const batch_size = min(max_batch_size, next_valid_count - pos);
+
+    int const target_pos = pos + batch_size;
+    int const src_pos    = pos + t;
+
+    // the position in the output column/buffer
+    int dst_pos = sb->nz_idx[rolling_index<rolling_buf_size>(src_pos)] - s->first_row;
+
+    // gpuOutputGeneric(s, sb, src_pos, static_cast<uint8_t*>(dst), dtype_len);
+    auto [ptr, len] = src_pos < target_pos && dst_pos >= 0
+                        ? gpuGetStringData(s, sb, src_pos)
+                        : cuda::std::pair<char const*, size_t>{nullptr, 0};
+
+    size_type offset, warp_total;
+    warp_scan(temp_storage[warp_id]).ExclusiveSum(len, offset, warp_total);
+
+    if (lane_id == 0) { warp_offsets[warp_id] = warp_total; }
+    __syncthreads();
+    if (t == 0) {
+      auto const offsets_ptr = &warp_offsets[0];
+      thrust::exclusive_scan(thrust::seq, offsets_ptr, offsets_ptr + num_warps, warp_offsets);
+    }
+    __syncthreads();
+    offset += warp_offsets[warp_id] + last_offset;
+
+    // choose a character parallel string copy when the average string is longer than a warp
+    auto const use_char_ll = warp_total / warp_size >= warp_size;
+
+    if (use_char_ll) {
+      offsets[warp_id][lane_id]  = offset;
+      pointers[warp_id][lane_id] = reinterpret_cast<uint8_t const*>(ptr);
+      dsts[warp_id][lane_id]     = dst_pos;
+      lengths[warp_id][lane_id]  = len;
+      __syncwarp();
+
+      auto const warp_pos = warp_id * warp_size + pos;
+      for (int ss = 0; ss < warp_size && ss + warp_pos < target_pos; ss++) {
+        if (dsts[warp_id][ss] >= 0) {
+          auto offptr = reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) +
+                        dsts[warp_id][ss];
+          *offptr      = lengths[warp_id][ss];
+          auto str_ptr = nesting_info_base[leaf_level_index].string_out + offsets[warp_id][ss];
+          ll_strcpy(str_ptr, pointers[warp_id][ss], lengths[warp_id][ss], lane_id);
+        }
+      }
+
+    } else {
+      if (src_pos < target_pos && dst_pos >= 0) {
+        auto offptr =
+          reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
+        *offptr      = len;
+        auto str_ptr = nesting_info_base[leaf_level_index].string_out + offset;
+        memcpy(str_ptr, ptr, len);
+      }
+      __syncwarp();
+    }
+
+    // last thread in last warp updates last_offset
+    if (warp_id == num_warps - 1 && lane_id == warp_size - 1) { last_offset = offset + len; }
+    __syncthreads();
+
+    pos += batch_size;
+  }
+
+  return last_offset;
+}
+
+/**
+ * @brief Kernel for computing string column data stored in the pages
+ *
+ * This function will write the page data and the page data's validity to the
+ * output specified in the page's column chunk.
+ *
+ * @param pages List of pages
+ * @param chunks List of column chunks
+ * @param min_row Row index to start reading at
+ * @param num_rows Maximum number of rows to read
+ * @param error_code Error code to set if an error is encountered
+ */
+template <typename level_t>
+CUDF_KERNEL void __launch_bounds__(decode_block_size)
+  gpuDecodeStringPageDataFlat(PageInfo* pages,
+                              device_span<ColumnChunkDesc const> chunks,
+                              size_t min_row,
+                              size_t num_rows,
+                              kernel_error::pointer error_code)
+{
+  using cudf::detail::warp_size;
+  __shared__ __align__(16) page_state_s state_g;
+  __shared__ __align__(16) page_state_buffers_s<rolling_buf_size,  // size of nz_idx buffer
+                                                1,                 // unused in this kernel
+                                                1>                 // unused in this kernel
+    state_buffers;
+  __shared__ __align__(4) size_type last_offset;
+
+  page_state_s* const s = &state_g;
+  auto* const sb        = &state_buffers;
+  int const page_idx    = blockIdx.x;
+  int const t           = threadIdx.x;
+  int const lane_id     = t % warp_size;
+  int const warp_id     = t / warp_size;
+  PageInfo* pp          = &pages[page_idx];
+
+  if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::STRING_FLAT_PLAIN))) { return; }
+
+  // must come after the kernel mask check
+  [[maybe_unused]] null_count_back_copier _{s, t};
+
+  if (!setupLocalPageInfo(s,
+                          pp,
+                          chunks,
+                          min_row,
+                          num_rows,
+                          mask_filter{decode_kernel_mask::STRING_FLAT_PLAIN},
+                          page_processing_stage::DECODE)) {
+    return;
+  }
+
+  // the level stream decoders
+  __shared__ rle_run<level_t> def_runs[rle_run_buffer_size];
+  rle_stream<level_t, decode_block_size, rolling_buf_size> def_decoder{def_runs};
+
+  // if we have no work to do (eg, in a skip_rows/num_rows case) in this page.
+  if (s->num_rows == 0) { return; }
+
+  bool const nullable            = is_nullable(s);
+  bool const nullable_with_nulls = nullable && has_nulls(s);
+
+  // initialize the stream decoders (requires values computed in setupLocalPageInfo)
+  level_t* const def = reinterpret_cast<level_t*>(pp->lvl_decode_buf[level_type::DEFINITION]);
+  if (nullable_with_nulls) {
+    def_decoder.init(s->col.level_bits[level_type::DEFINITION],
+                     s->abs_lvl_start[level_type::DEFINITION],
+                     s->abs_lvl_end[level_type::DEFINITION],
+                     def,
+                     s->page.num_input_values);
+  }
+  __syncthreads();
+
+  // We use two counters in the loop below: processed_count and valid_count.
+  // - processed_count: number of rows out of num_input_values that we have decoded so far.
+  //   the definition stream returns the number of total rows it has processed in each call
+  //   to decode_next and we accumulate in process_count.
+  // - valid_count: number of non-null rows we have decoded so far. In each iteration of the
+  //   loop below, we look at the number of valid items (which could be all for non-nullable),
+  //   and valid_count is that running count.
+  int processed_count = 0;
+  int valid_count     = 0;
+  // the core loop. decode batches of level stream data using rle_stream objects
+  // and pass the results to gpuDecodeValues
+  while (s->error == 0 && processed_count < s->page.num_input_values) {
+    int next_valid_count;
+
+    // only need to process definition levels if this is a nullable column
+    if (nullable_with_nulls) {
+      processed_count += def_decoder.decode_next(t);
+      __syncthreads();
+
+      next_valid_count =
+        gpuUpdateValidityOffsetsAndRowIndicesFlat<decode_block_size, true, level_t>(
+          processed_count, s, sb, def, t);
+    }
+    // if we wanted to split off the skip_rows/num_rows case into a separate kernel, we could skip
+    // this function call entirely since all it will ever generate is a mapping of (i -> i) for
+    // nz_idx.  gpuDecodeValues would be the only work that happens.
+    else {
+      processed_count += min(rolling_buf_size, s->page.num_input_values - processed_count);
+      next_valid_count =
+        gpuUpdateValidityOffsetsAndRowIndicesFlat<decode_block_size, false, level_t>(
+          processed_count, s, sb, nullptr, t);
+    }
+    __syncthreads();
+
+    // decode the values themselves
+    gpuDecodeValues(s, sb, valid_count, next_valid_count, t);
+    __syncthreads();
+
+    valid_count = next_valid_count;
+  }
+  if (t == 0 and s->error != 0) { set_error(s->error, error_code); }
+}
+
 /**
  * @brief Kernel for computing string dictionary column data stored in the pages
  *
@@ -1286,6 +1492,11 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     dict_stream.decode_next(t, next_valid_count - valid_count);
     __syncthreads();
 
+#if 1
+    auto const new_offset =
+      gpuDecodeStringValues(s, sb, valid_coount, next_valid_count, last_offset);
+    if (t == 0) { last_offset = new_offset; }
+#else
     // FIXME: refactor once both string microkernels are done
     // decode the values themselves
     // gpuDecodeValues(s, sb, valid_count, next_valid_count, t);
@@ -1364,6 +1575,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
 
       pos += batch_size;
     }
+#endif
     __syncthreads();
 
     valid_count = next_valid_count;
@@ -1500,7 +1712,32 @@ void __host__ DecodeStringPageData(cudf::detail::hostdevice_span<PageInfo> pages
 }
 
 /**
- * @copydoc cudf::io::parquet::detail::DecodeStringPageData
+ * @copydoc cudf::io::parquet::detail::DecodeStringPageDataFlat
+ */
+void __host__ DecodeStringPageDataFlat(cudf::detail::hostdevice_span<PageInfo> pages,
+                                       cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
+                                       size_t num_rows,
+                                       size_t min_row,
+                                       int level_type_size,
+                                       kernel_error::pointer error_code,
+                                       rmm::cuda_stream_view stream)
+{
+  CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
+
+  dim3 dim_block(decode_block_size, 1);
+  dim3 dim_grid(pages.size(), 1);  // 1 threadblock per page
+
+  if (level_type_size == 1) {
+    gpuDecodeStringPageDataFlat<uint8_t><<<dim_grid, dim_block, 0, stream.value()>>>(
+      pages.device_ptr(), chunks, min_row, num_rows, error_code);
+  } else {
+    gpuDecodeStringPageDataFlat<uint16_t><<<dim_grid, dim_block, 0, stream.value()>>>(
+      pages.device_ptr(), chunks, min_row, num_rows, error_code);
+  }
+}
+
+/**
+ * @copydoc cudf::io::parquet::detail::DecodeStringPageDataFlatDict
  */
 void __host__
 DecodeStringPageDataFlatDict(cudf::detail::hostdevice_span<PageInfo> pages,
