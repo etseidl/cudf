@@ -1229,7 +1229,6 @@ __device__ size_type gpuDecodeStringValues(
           ll_strcpy(str_ptr, pointers[warp_id][ss], lengths[warp_id][ss], lane_id);
         }
       }
-
     } else {
       if (src_pos < target_pos && dst_pos >= 0) {
         auto offptr =
@@ -1238,16 +1237,16 @@ __device__ size_type gpuDecodeStringValues(
         auto str_ptr = nesting_info_base[leaf_level_index].string_out + offset;
         memcpy(str_ptr, ptr, len);
       }
-      __syncwarp();
     }
 
     // last thread in last warp updates last_offset
+    __syncthreads();  // need to make sure every thread has read last_offset before writing to it
     if (warp_id == num_warps - 1 && lane_id == warp_size - 1) { last_offset = offset + len; }
-    __syncthreads();
 
     pos += batch_size;
   }
 
+  __syncthreads();
   return last_offset;
 }
 
