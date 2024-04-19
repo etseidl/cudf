@@ -1162,10 +1162,10 @@ __device__ size_type gpuDecodeStringValues(
   using warp_scan              = cub::WarpScan<size_type>;
   __shared__ warp_scan::TempStorage temp_storage[num_warps];
   __shared__ size_type warp_offsets[num_warps];
-  __shared__ __align__(8) uint8_t const* pointers[num_warps][warp_size];
-  __shared__ __align__(4) size_type offsets[num_warps][warp_size];
-  __shared__ __align__(4) int dsts[num_warps][warp_size];
-  __shared__ __align__(4) int lengths[num_warps][warp_size];
+  __shared__ __align__(8) uint8_t const* pointers[num_warps];
+  __shared__ __align__(4) size_type offsets[num_warps];
+  __shared__ __align__(4) int dsts[num_warps];
+  __shared__ __align__(4) int lengths[num_warps];
   __shared__ size_type last_offset;
 
   int const t       = threadIdx.x;
@@ -1221,23 +1221,22 @@ __device__ size_type gpuDecodeStringValues(
         }
       }
     } else if (use_char_ll) {
-      // TODO rather than a matrix, just have a per-warp value, and then assign based on the
-      // value of `ss`. That should cut shared mem use alot, but at the expense of another
-      // syncwarp per iteration.
-      offsets[warp_id][lane_id]  = offset;
-      pointers[warp_id][lane_id] = reinterpret_cast<uint8_t const*>(ptr);
-      dsts[warp_id][lane_id]     = dst_pos;
-      lengths[warp_id][lane_id]  = len;
-      __syncwarp();
-
       auto const warp_pos = warp_id * warp_size + pos;
       for (int ss = 0; ss < warp_size && ss + warp_pos < target_pos; ss++) {
-        if (dsts[warp_id][ss] >= 0) {
+        if (ss == lane_id) {
+          offsets[warp_id]  = offset;
+          pointers[warp_id] = reinterpret_cast<uint8_t const*>(ptr);
+          dsts[warp_id]     = dst_pos;
+          lengths[warp_id]  = len;
+        }
+        __syncwarp();
+
+        if (dsts[warp_id] >= 0) {
           auto offptr = reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) +
-                        dsts[warp_id][ss];
-          *offptr      = lengths[warp_id][ss];
-          auto str_ptr = nesting_info_base[leaf_level_index].string_out + offsets[warp_id][ss];
-          ll_strcpy(str_ptr, pointers[warp_id][ss], lengths[warp_id][ss], lane_id);
+                        dsts[warp_id];
+          *offptr      = lengths[warp_id];
+          auto str_ptr = nesting_info_base[leaf_level_index].string_out + offsets[warp_id];
+          ll_strcpy(str_ptr, pointers[warp_id], lengths[warp_id], lane_id);
         }
       }
     } else {
@@ -1274,7 +1273,7 @@ __device__ size_type gpuDecodeStringValues(
  * @param error_code Error code to set if an error is encountered
  */
 template <typename level_t>
-CUDF_KERNEL void __launch_bounds__(decode_block_size)
+CUDF_KERNEL void __launch_bounds__(decode_block_size, 12)
   gpuDecodeStringPageDataFlat(PageInfo* pages,
                               device_span<ColumnChunkDesc const> chunks,
                               size_t min_row,
@@ -1404,7 +1403,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
  * @param error_code Error code to set if an error is encountered
  */
 template <typename level_t>
-CUDF_KERNEL void __launch_bounds__(decode_block_size)
+CUDF_KERNEL void __launch_bounds__(decode_block_size, 8)
   gpuDecodeStringPageDataFlatDict(PageInfo* pages,
                                   device_span<ColumnChunkDesc const> chunks,
                                   size_t min_row,
