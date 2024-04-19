@@ -222,8 +222,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   int const t           = threadIdx.x;
   PageInfo* pp          = &pages[page_idx];
 
-  if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::FIXED_WIDTH_NO_DICT))) { return; }
-
   // must come after the kernel mask check
   [[maybe_unused]] null_count_back_copier _{s, t};
 
@@ -334,8 +332,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   int const page_idx    = blockIdx.x;
   int const t           = threadIdx.x;
   PageInfo* pp          = &pages[page_idx];
-
-  if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::FIXED_WIDTH_DICT))) { return; }
 
   // must come after the kernel mask check
   [[maybe_unused]] null_count_back_copier _{s, t};
@@ -460,11 +456,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   int const page_idx    = blockIdx.x;
   int const t           = threadIdx.x;
   PageInfo* pp          = &pages[page_idx];
-
-  // FIXME: this shouldn't be here...the check is already in setupLocalPageInfo
-  if (!(BitAnd(pages[page_idx].kernel_mask, decode_kernel_mask::BYTE_STREAM_SPLIT_FLAT))) {
-    return;
-  }
 
   // must come after the kernel mask check
   [[maybe_unused]] null_count_back_copier _{s, t};
