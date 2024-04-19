@@ -1209,7 +1209,18 @@ __device__ size_type gpuDecodeStringValues(
     // choose a character parallel string copy when the average string is longer than a warp
     auto const use_char_ll = warp_total / warp_size >= warp_size;
 
-    if (use_char_ll) {
+    if (s->page.encoding == Encoding::BYTE_STREAM_SPLIT) {
+      if (src_pos < target_pos && dst_pos >= 0) {
+        auto const stride = s->page.str_bytes / s->dtype_len_in;
+        auto offptr =
+          reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
+        *offptr      = len;
+        auto str_ptr = nesting_info_base[leaf_level_index].string_out + offset;
+        for (int ii = 0; ii < s->dtype_len_in; ii++) {
+          str_ptr[ii] = s->data_start[src_pos + ii * stride];
+        }
+      }
+    } else if (use_char_ll) {
       // TODO rather than a matrix, just have a per-warp value, and then assign based on the
       // value of `ss`. That should cut shared mem use alot, but at the expense of another
       // syncwarp per iteration.
