@@ -1281,10 +1281,16 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size, 12)
                               kernel_error::pointer error_code)
 {
   using cudf::detail::warp_size;
+#define RR 1
+#if RR
+  constexpr int dsize = 1;
+#else
+  constexpr int dsize = rolling_buf_size;
+#endif
   __shared__ __align__(16) page_state_s state_g;
   __shared__ __align__(16) page_state_buffers_s<rolling_buf_size,  // size of nz_idx buffer
-                                                rolling_buf_size,  // dictionary
-                                                rolling_buf_size>  // string lengths
+                                                dsize,             // dictionary
+                                                dsize>             // string lengths
     state_buffers;
 
   page_state_s* const s = &state_g;
@@ -1351,6 +1357,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size, 12)
   while (s->error == 0 && processed_count < s->page.num_input_values) {
     int next_valid_count;
 
+    // 2ms
     // only need to process definition levels if this is a nullable column
     if (nullable_with_nulls) {
       processed_count += def_decoder.decode_next(t);
@@ -1370,12 +1377,73 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size, 12)
           processed_count, s, sb, nullptr, t);
     }
     __syncthreads();
-
+#if !RR
+    // 20ms
     gpuInitStringDescriptors<false>(s, sb, next_valid_count, t);
     if (t == 0) { s->dict_pos = next_valid_count; }
 
+    // 18 ms
     // decode the values themselves
     string_offset = gpuDecodeStringValues(s, sb, valid_count, next_valid_count, string_offset);
+#else
+    uint8_t const* data = s->data_start;
+    int dict_size       = s->dict_size;
+    int k               = s->dict_val;
+    int pos             = valid_count;
+    int t0              = 0;  // thread 0 for each string
+    while (pos < next_valid_count) {
+      // get position and length of next string (replaces gpuInitStringDescriptors)
+      int len = 0;
+      if (s->col.physical_type == FIXED_LEN_BYTE_ARRAY) {
+        if (k < dict_size) { len = s->dtype_len_in; }
+      } else {
+        if (k + 4 <= dict_size) {
+          len = (data[k]) | (data[k + 1] << 8) | (data[k + 2] << 16) | (data[k + 3] << 24);
+          k += 4;
+          if (k + len > dict_size) { len = 0; }
+        }
+      }
+
+      // copy string at `k` of length `len` to buffer
+      // calculate ids for this string
+      int const tid     = (t - t0 + decode_block_size) % decode_block_size;
+      int const src_pos = pos;
+
+      // the position in the output column/buffer
+      int dst_pos = sb->nz_idx[rolling_index<rolling_buf_size>(src_pos)] - s->first_row;
+      if (dst_pos >= 0) {
+        if (tid == 0) {
+          auto offptr =
+            reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
+          *offptr = len;
+        }
+        auto str_ptr = nesting_info_base[leaf_level_index].string_out + string_offset;
+        // TODO: byte stream split for FLBA
+#if 0
+        if (len < 32) {
+          if (tid == 0) { memcpy(str_ptr, data + k, len); }
+          t0 = (t0 + 1) % decode_block_size;
+        } else {
+          for (size_type idx = tid; idx < len; idx += decode_block_size) {
+            str_ptr[idx] = data[k + idx];
+          }
+          t0 = (t0 + len) % decode_block_size;
+        }
+#else
+        for (size_type idx = tid; idx < len; idx += decode_block_size) {
+          str_ptr[idx] = data[k + idx];
+        }
+        t0 = (t0 + len) % decode_block_size;
+#endif
+        string_offset += len;
+      }
+
+      k += len;
+      pos++;
+    }
+
+    if (t == 0) { s->dict_val = k; }
+#endif
     __syncthreads();
 
     valid_count = next_valid_count;
