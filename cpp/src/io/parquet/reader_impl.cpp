@@ -221,16 +221,6 @@ void reader::impl::decode_page_data(bool uses_custom_row_bounds, size_t skip_row
                          streams[s_idx++]);
   }
 
-  if (BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_PLAIN)) {
-    DecodeStringPageDataFlat(subpass.pages,
-                             pass.chunks,
-                             num_rows,
-                             skip_rows,
-                             level_type_size,
-                             error_code.data(),
-                             streams[s_idx++]);
-  }
-
   if (BitAnd(kernel_mask, decode_kernel_mask::STRING_FLAT_DICT)) {
     DecodeStringPageDataFlatDict(subpass.pages,
                                  pass.chunks,

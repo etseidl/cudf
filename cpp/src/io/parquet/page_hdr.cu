@@ -176,15 +176,12 @@ __device__ decode_kernel_mask kernel_mask_for_page(PageInfo const& page,
   } else if (is_string_col(chunk)) {
     // check for string before byte_stream_split so FLBA will go to the right kernel
     if (!is_nested(chunk)) {
-      if (page.encoding == Encoding::PLAIN) {
-        return decode_kernel_mask::STRING_FLAT_PLAIN;
-      } else if (page.encoding == Encoding::PLAIN_DICTIONARY ||
-                 page.encoding == Encoding::RLE_DICTIONARY) {
+      if (page.encoding == Encoding::PLAIN_DICTIONARY ||
+          page.encoding == Encoding::RLE_DICTIONARY) {
         return decode_kernel_mask::STRING_FLAT_DICT;
       }
-    } else {
-      return decode_kernel_mask::STRING;
     }
+    return decode_kernel_mask::STRING;
   }
 
   // check for micro kernels
