@@ -1277,7 +1277,6 @@ __device__ size_type gpuDecodeStringValuesW(
 
   int const t       = threadIdx.x;
   int const lane_id = t % warp_size;
-  int const warp_id = t / warp_size;
 
   // nesting level that is storing actual leaf values
   int const leaf_level_index               = s->col.max_nesting_depth - 1;
@@ -1307,7 +1306,7 @@ __device__ size_type gpuDecodeStringValuesW(
 
         size_type offset, warp_total;
         warp_scan(temp_storage).ExclusiveSum(len, offset, warp_total);
-
+        __syncwarp();
         offset += last_offset;
 
         // choose a character parallel string copy when the average string is longer than a warp
@@ -1325,8 +1324,7 @@ __device__ size_type gpuDecodeStringValuesW(
             }
           }
         } else if (use_char_ll) {
-          auto const warp_pos = warp_id * warp_size + pos;
-          for (int ss = 0; ss < warp_size && ss + pos < target_pos; ss++) {
+          for (int ss = 0; ss < warp_size && ss + i * warp_size + pos < target_pos; ss++) {
             if (ss == lane_id) {
               offsets  = offset;
               pointers = reinterpret_cast<uint8_t const*>(ptr);
@@ -1337,8 +1335,7 @@ __device__ size_type gpuDecodeStringValuesW(
 
             if (dsts >= 0) {
               auto offptr =
-                reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) +
-                dsts;
+                reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dsts;
               *offptr      = lengths;
               auto str_ptr = nesting_info_base[leaf_level_index].string_out + offsets;
               ll_strcpy(str_ptr, pointers, lengths, lane_id);
@@ -1356,7 +1353,7 @@ __device__ size_type gpuDecodeStringValuesW(
 
         // last thread in last warp updates last_offset
         __syncwarp();  // need to make sure every thread has read last_offset before writing to
-                          // it
+                       // it
         if (lane_id == warp_size - 1) { last_offset = offset + len; }
       }
       pos += batch_size;
@@ -1379,9 +1376,8 @@ __device__ size_type gpuDecodeStringValuesW(
  * @param num_rows Maximum number of rows to read
  * @param error_code Error code to set if an error is encountered
  */
-constexpr int plain_block_size = 64;
 template <typename level_t>
-CUDF_KERNEL void __launch_bounds__(plain_block_size, 12)
+CUDF_KERNEL void __launch_bounds__(decode_block_size, 12)
   gpuDecodeStringPageDataFlat(PageInfo* pages,
                               device_span<ColumnChunkDesc const> chunks,
                               size_t min_row,
@@ -1393,12 +1389,12 @@ CUDF_KERNEL void __launch_bounds__(plain_block_size, 12)
 #if RR
   constexpr int dsize = 1;
 #else
-  constexpr int dsize = plain_block_size * 2;
+  constexpr int dsize = rolling_buf_size;
 #endif
   __shared__ __align__(16) page_state_s state_g;
-  __shared__ __align__(16) page_state_buffers_s<plain_block_size * 2,  // size of nz_idx buffer
-                                                dsize,                 // dictionary
-                                                dsize>                 // string lengths
+  __shared__ __align__(16) page_state_buffers_s<rolling_buf_size,  // size of nz_idx buffer
+                                                dsize,             // dictionary
+                                                dsize>             // string lengths
     state_buffers;
 
   page_state_s* const s = &state_g;
@@ -1426,11 +1422,11 @@ CUDF_KERNEL void __launch_bounds__(plain_block_size, 12)
 
   // the required number of runs in shared memory we will need to provide the
   // rle_stream object
-  constexpr int rle_run_buffer_size = rle_stream_required_run_buffer_size<plain_block_size>();
+  constexpr int rle_run_buffer_size = rle_stream_required_run_buffer_size<decode_block_size>();
 
   // the level stream decoders
   __shared__ rle_run<level_t> def_runs[rle_run_buffer_size];
-  rle_stream<level_t, plain_block_size, plain_block_size * 2> def_decoder{def_runs};
+  rle_stream<level_t, decode_block_size, rolling_buf_size> def_decoder{def_runs};
 
   // if we have no work to do (eg, in a skip_rows/num_rows case) in this page.
   if (s->num_rows == 0) { return; }
@@ -1471,8 +1467,9 @@ CUDF_KERNEL void __launch_bounds__(plain_block_size, 12)
       processed_count += def_decoder.decode_next(t);
       __syncthreads();
 
-      next_valid_count = gpuUpdateValidityOffsetsAndRowIndicesFlat<plain_block_size, true, level_t>(
-        processed_count, s, sb, def, t);
+      next_valid_count =
+        gpuUpdateValidityOffsetsAndRowIndicesFlat<decode_block_size, true, level_t>(
+          processed_count, s, sb, def, t);
     }
     // if we wanted to split off the skip_rows/num_rows case into a separate kernel, we could skip
     // this function call entirely since all it will ever generate is a mapping of (i -> i) for
@@ -1480,7 +1477,7 @@ CUDF_KERNEL void __launch_bounds__(plain_block_size, 12)
     else {
       processed_count += min(rolling_buf_size, s->page.num_input_values - processed_count);
       next_valid_count =
-        gpuUpdateValidityOffsetsAndRowIndicesFlat<plain_block_size, false, level_t>(
+        gpuUpdateValidityOffsetsAndRowIndicesFlat<decode_block_size, false, level_t>(
           processed_count, s, sb, nullptr, t);
     }
     __syncthreads();
@@ -1560,7 +1557,7 @@ CUDF_KERNEL void __launch_bounds__(plain_block_size, 12)
   int value_count = nesting_info_base[leaf_level_index].value_count - s->first_row;
 
   auto const offptr = reinterpret_cast<size_type*>(nesting_info_base[leaf_level_index].data_out);
-  block_excl_sum<plain_block_size>(offptr, value_count, s->page.str_offset);
+  block_excl_sum<decode_block_size>(offptr, value_count, s->page.str_offset);
 
   if (t == 0 and s->error != 0) { set_error(s->error, error_code); }
 }
@@ -1837,7 +1834,7 @@ void __host__ DecodeStringPageDataFlat(cudf::detail::hostdevice_span<PageInfo> p
 {
   CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
 
-  dim3 dim_block(plain_block_size, 1);
+  dim3 dim_block(decode_block_size, 1);
   dim3 dim_grid(pages.size(), 1);  // 1 threadblock per page
 
   if (level_type_size == 1) {
