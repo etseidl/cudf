@@ -1260,6 +1260,113 @@ __device__ size_type gpuDecodeStringValues(
   return last_offset;
 }
 
+template <typename state_buf>
+__device__ size_type gpuDecodeStringValuesW(
+  page_state_s* s, state_buf* const sb, int start, int end, size_type starting_offset)
+{
+  using cudf::detail::warp_size;
+  constexpr int num_warps      = decode_block_size / warp_size;
+  constexpr int max_batch_size = num_warps * warp_size;
+  using warp_scan              = cub::WarpScan<size_type>;
+  __shared__ warp_scan::TempStorage temp_storage;
+  __shared__ __align__(8) uint8_t const* pointers;
+  __shared__ __align__(4) size_type offsets;
+  __shared__ __align__(4) int dsts;
+  __shared__ __align__(4) int lengths;
+  __shared__ size_type last_offset;
+
+  int const t       = threadIdx.x;
+  int const lane_id = t % warp_size;
+  int const warp_id = t / warp_size;
+
+  // nesting level that is storing actual leaf values
+  int const leaf_level_index               = s->col.max_nesting_depth - 1;
+  PageNestingDecodeInfo* nesting_info_base = s->nesting_info;
+
+  if (t == 0) { last_offset = starting_offset; }
+  __syncthreads();
+
+  if (t < warp_size) {
+    int pos = start;
+    while (pos < end) {
+      int const batch_size = min(max_batch_size, end - pos);
+      int const target_pos = pos + batch_size;
+      int const src_pos    = pos + t;
+
+      for (int i = 0; i < num_warps; i++) {
+        // src_pos for current warp
+        auto const spos = src_pos + i * warp_size;
+
+        // the position in the output column/buffer
+        int dst_pos = sb->nz_idx[rolling_index<rolling_buf_size>(spos)] - s->first_row;
+
+        // calculate per-warp offsets
+        auto [ptr, len] = spos < target_pos && dst_pos >= 0
+                            ? gpuGetStringData(s, sb, spos)
+                            : cuda::std::pair<char const*, size_t>{nullptr, 0};
+
+        size_type offset, warp_total;
+        warp_scan(temp_storage).ExclusiveSum(len, offset, warp_total);
+
+        offset += last_offset;
+
+        // choose a character parallel string copy when the average string is longer than a warp
+        auto const use_char_ll = warp_total / warp_size >= warp_size;
+
+        if (s->page.encoding == Encoding::BYTE_STREAM_SPLIT) {
+          if (spos < target_pos && dst_pos >= 0) {
+            auto const stride = s->page.str_bytes / s->dtype_len_in;
+            auto offptr =
+              reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
+            *offptr      = len;
+            auto str_ptr = nesting_info_base[leaf_level_index].string_out + offset;
+            for (int ii = 0; ii < s->dtype_len_in; ii++) {
+              str_ptr[ii] = s->data_start[spos + ii * stride];
+            }
+          }
+        } else if (use_char_ll) {
+          auto const warp_pos = warp_id * warp_size + pos;
+          for (int ss = 0; ss < warp_size && ss + pos < target_pos; ss++) {
+            if (ss == lane_id) {
+              offsets  = offset;
+              pointers = reinterpret_cast<uint8_t const*>(ptr);
+              dsts     = dst_pos;
+              lengths  = len;
+            }
+            __syncwarp();
+
+            if (dsts >= 0) {
+              auto offptr =
+                reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) +
+                dsts;
+              *offptr      = lengths;
+              auto str_ptr = nesting_info_base[leaf_level_index].string_out + offsets;
+              ll_strcpy(str_ptr, pointers, lengths, lane_id);
+            }
+          }
+        } else {
+          if (spos < target_pos && dst_pos >= 0) {
+            auto offptr =
+              reinterpret_cast<int32_t*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
+            *offptr      = len;
+            auto str_ptr = nesting_info_base[leaf_level_index].string_out + offset;
+            memcpy(str_ptr, ptr, len);
+          }
+        }
+
+        // last thread in last warp updates last_offset
+        __syncwarp();  // need to make sure every thread has read last_offset before writing to
+                          // it
+        if (lane_id == warp_size - 1) { last_offset = offset + len; }
+      }
+      pos += batch_size;
+    }
+  }
+
+  __syncthreads();
+  return last_offset;
+}
+
 /**
  * @brief Kernel for computing string column data stored in the pages
  *
