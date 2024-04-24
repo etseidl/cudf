@@ -182,9 +182,8 @@ __device__ decode_kernel_mask kernel_mask_for_page(PageInfo const& page,
                  page.encoding == Encoding::RLE_DICTIONARY) {
         return decode_kernel_mask::STRING_FLAT_DICT;
       }
-    } else {
-      return decode_kernel_mask::STRING;
     }
+    return decode_kernel_mask::STRING;
   }
 
   // check for micro kernels
