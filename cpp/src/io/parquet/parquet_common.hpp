@@ -91,7 +91,8 @@ enum class Encoding : uint8_t {
   DELTA_BYTE_ARRAY        = 7,
   RLE_DICTIONARY          = 8,
   BYTE_STREAM_SPLIT       = 9,
-  NUM_ENCODINGS           = 10,
+  PLAIN_V2                = 10,
+  NUM_ENCODINGS           = 11,
 };
 
 /**

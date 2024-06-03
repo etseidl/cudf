@@ -2489,6 +2489,144 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
     s, strings_ptr + str_data_len, pages, comp_in, comp_out, comp_results, true);
 }
 
+// experimental (name tbd) page data encoder
+// proposed on parquet M/L as RANDOM_ACCESS_BYTE_ARRAY
+// this encoding allows for random access in the absence of nulls
+//
+// format is:
+//   | concatenated byte data (length given by unencoded_byte_array_data_bytes) |
+//   | offsets (length (num_non_nulls + 1) * byte_width) |
+//   | byte_width (1 byte, can be 0-4, 4GB page limit) |
+// 
+// we should have enough page data for char data + num_non_nulls * 4 + 1
+// so first copy lengths into start of buffer, then do exclusive sum to
+// convert to offsets. from max offset calculate number of bytes needed for
+// offsets. truncate into place at end of array, and add byte_width.
+// finally copy char data into start of buffer.
+//
+// blockDim(128, 1, 1)
+template <int block_size>
+CUDF_KERNEL void __launch_bounds__(block_size, 8)
+  gpuEncodePlainV2Pages(device_span<EncPage> pages,
+                        device_span<device_span<uint8_t const>> comp_in,
+                        device_span<device_span<uint8_t>> comp_out,
+                        device_span<compression_result> comp_results)
+{
+  __shared__ __align__(8) page_enc_state_s<0> state_g;
+  __shared__ uint8_t const* first_string;
+  __shared__ size_type string_data_len;
+  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
+  typename block_reduce::TempStorage reduce_storage;
+
+  auto* const s = &state_g;
+  uint32_t t    = threadIdx.x;
+
+  if (t == 0) {
+    state_g        = page_enc_state_s<0>{};
+    s->page        = pages[blockIdx.x];
+    s->ck          = *s->page.chunk;
+    s->col         = *s->ck.col_desc;
+    s->rle_len_pos = nullptr;
+    // get s->cur back to where it was at the end of encoding the rep and def level data
+    set_page_data_start(s);
+  }
+  __syncthreads();
+
+  if (BitAnd(s->page.kernel_mask, encode_kernel_mask::PLAIN_V2) == 0) { return; }
+
+  // Encode data values
+  if (t == 0) {
+    s->rle_run         = 0;
+    s->rle_pos         = 0;
+    s->rle_numvals     = 0;
+    s->rle_out         = s->cur;
+    s->page.encoding   = Encoding::PLAIN_V2;
+    s->page_start_val  = row_to_value_idx(s->page.start_row, s->col);
+    s->chunk_start_val = row_to_value_idx(s->ck.start_row, s->col);
+  }
+  __syncthreads();
+
+  auto const type_id = s->col.leaf_column->type().id();
+
+  if (t == 0) {
+    first_string = nullptr;
+
+    // if there are valid values, find a pointer to the first valid string
+    if (s->page.num_valid != 0) {
+      for (uint32_t idx = 0; idx < s->page.num_leaf_values; idx++) {
+        size_type const idx_in_col = s->page_start_val + idx;
+        if (s->col.leaf_column->is_valid(idx_in_col)) {
+          if (type_id == type_id::STRING) {
+            first_string = reinterpret_cast<uint8_t const*>(
+              s->col.leaf_column->element<string_view>(idx_in_col).data());
+          } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+            first_string = reinterpret_cast<uint8_t const*>(
+              get_element<statistics::byte_array_view>(*s->col.leaf_column, idx_in_col).data());
+          }
+          break;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // copy lengths into buffer
+  uint32_t len = 0;
+  uint32_t* lengths = static_cast<uint32_t*>(s->cur); // TODO need to align this properly
+  for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
+    uint32_t const nvals = min(s->page.num_leaf_values - cur_val_idx, delta::block_size);
+
+    size_type const val_idx_in_block = cur_val_idx + t;
+    size_type const val_idx          = s->page_start_val + val_idx_in_block;
+
+    bool const is_valid =
+      (val_idx < s->col.leaf_column->size() && val_idx_in_block < s->page.num_leaf_values)
+        ? s->col.leaf_column->is_valid(val_idx)
+        : false;
+
+    cur_val_idx += nvals;
+
+    int32_t v = 0;
+    if (is_valid) {
+      if (type_id == type_id::STRING) {
+        v = s->col.leaf_column->element<string_view>(val_idx).size_bytes();
+      } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+        auto const arr_size =
+          get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx).size_bytes();
+        // the lengths are assumed to be INT32, check for overflow
+        if (arr_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+          CUDF_UNREACHABLE("byte array size exceeds 2GB");
+        }
+        v = static_cast<int32_t>(arr_size);
+      }
+      len += v;
+
+      int my_idx = 0;
+      // TODO: do excl scan on valids to get proper offsets
+      lengths[my_idx] = v;
+    }
+  }
+
+  // excl scan lengths to get offsets
+
+  if (t == 0) { string_data_len = lengths[s->page.num_leaf_values]; }
+  __syncthreads();
+
+  int byte_width = width_for_offset(string_data_len);
+  // now copy offsets into proper location
+  auto offs = s->cur + string_data_len;
+
+  for (int i = t; i < s->page.num_leaf_values; i += block_size) {
+    offs[i] = lengths[i]; // FIXME truncate to byte width
+  }
+
+  // now copy the char data
+  memcpy_block<block_size, true>(s->cur, first_string, string_data_len, t);
+
+  finish_page_encode<block_size>(
+    s, output_ptr + string_data_len, pages, comp_in, comp_out, comp_results, true);
+}
+
 constexpr int decide_compression_warps_in_block = 4;
 constexpr int decide_compression_block_size =
   decide_compression_warps_in_block * cudf::detail::warp_size;

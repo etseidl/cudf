@@ -535,6 +535,7 @@ enum class encode_kernel_mask {
   DELTA_LENGTH_BA   = (1 << 3),  // Run DELTA_LENGTH_BYTE_ARRAY encoding kernel
   DELTA_BYTE_ARRAY  = (1 << 4),  // Run DELTA_BYtE_ARRAY encoding kernel
   BYTE_STREAM_SPLIT = (1 << 5),  // Run plain encoding kernel, but split streams
+  PLAIN_V2          = (1 << 6),
 };
 
 /**
