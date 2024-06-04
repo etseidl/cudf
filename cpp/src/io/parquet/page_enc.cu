@@ -2496,7 +2496,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 // format is:
 //   | concatenated byte data (length given by unencoded_byte_array_data_bytes) |
 //   | offsets (length (num_non_nulls + 1) * byte_width) |
-//   | byte_width (1 byte, can be 0-4, 4GB page limit) |
+//   | byte_width (1 byte, can be 0-4, 2GB page limit) |
 // 
 // we should have enough page data for char data + num_non_nulls * 4 + 1
 // so first copy lengths into start of buffer, then do exclusive sum to
@@ -2515,8 +2515,8 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   __shared__ __align__(8) page_enc_state_s<0> state_g;
   __shared__ uint8_t const* first_string;
   __shared__ size_type string_data_len;
-  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
-  typename block_reduce::TempStorage reduce_storage;
+  using block_scan = cub::BlockScan<size_type, block_size>;
+  typename block_scan::TempStorage tmp_storage;
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -2571,10 +2571,13 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   __syncthreads();
 
   // copy lengths into buffer
-  uint32_t len = 0;
-  uint32_t* lengths = static_cast<uint32_t*>(s->cur); // TODO need to align this properly
+  size_type* lengths = static_cast<size_type*>(s->cur);
+  // align to 4 byte boundary
+  lengths = util::round_up_safe(reinterpret_cast<std::uintptr_t>(lengths), sizeof(size_type));
+  size_type valid_count = 0;
+
   for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
-    uint32_t const nvals = min(s->page.num_leaf_values - cur_val_idx, delta::block_size);
+    uint32_t const nvals = min(s->page.num_leaf_values - cur_val_idx, block_size);
 
     size_type const val_idx_in_block = cur_val_idx + t;
     size_type const val_idx          = s->page_start_val + val_idx_in_block;
@@ -2585,6 +2588,9 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
         : false;
 
     cur_val_idx += nvals;
+
+    size_type pos, num_valid;
+    block_scan(temp_storage).ExclusiveSum(valid, pos, num_valid);
 
     int32_t v = 0;
     if (is_valid) {
@@ -2599,32 +2605,44 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
         }
         v = static_cast<int32_t>(arr_size);
       }
-      len += v;
 
-      int my_idx = 0;
-      // TODO: do excl scan on valids to get proper offsets
-      lengths[my_idx] = v;
+      lengths[valid_count + pos] = v;
     }
+
+    valid_count += num_valid;
   }
 
   // excl scan lengths to get offsets
+  block_excl_sum(lengths, valid_count + 1, 0);
 
-  if (t == 0) { string_data_len = lengths[s->page.num_leaf_values]; }
+  if (t == 0) { string_data_len = lengths[valid_count]; }
   __syncthreads();
 
-  int byte_width = width_for_offset(string_data_len);
+  int bit_width = 32 - __clz(string_data_len);
+  int byte_width = util::round_up_safe(bit_width, 8);
+
   // now copy offsets into proper location
   auto offs = s->cur + string_data_len;
 
-  for (int i = t; i < s->page.num_leaf_values; i += block_size) {
-    offs[i] = lengths[i]; // FIXME truncate to byte width
+  // copy valid_count + 1 offsets into place
+  for (int i = t; i <= valid_count; i += block_size) {
+    auto len = lengths[i];
+    auto off = i * byte_width;
+    for (int b = 0; b < byte_width; b++, off++) {
+      offs[off] = len;
+      len >>= 8;
+    }
   }
+
+  // save byte width
+  offs[byte_width * (valid_count + 1)] = byte_width;
+  auto const end_ptr = &offs[byte_width * (valid_count + 1) + 1];
 
   // now copy the char data
   memcpy_block<block_size, true>(s->cur, first_string, string_data_len, t);
 
   finish_page_encode<block_size>(
-    s, output_ptr + string_data_len, pages, comp_in, comp_out, comp_results, true);
+    s, end_ptr, pages, comp_in, comp_out, comp_results, true);
 }
 
 constexpr int decide_compression_warps_in_block = 4;
