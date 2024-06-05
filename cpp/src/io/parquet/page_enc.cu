@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "cudf/io/types.hpp"
 #include "delta_enc.cuh"
 #include "io/parquet/parquet_gpu.hpp"
 #include "io/utilities/block_utils.cuh"
@@ -518,6 +519,7 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
       case column_encoding::DELTA_LENGTH_BYTE_ARRAY: return encode_kernel_mask::DELTA_LENGTH_BA;
       case column_encoding::DELTA_BYTE_ARRAY: return encode_kernel_mask::DELTA_BYTE_ARRAY;
       case column_encoding::BYTE_STREAM_SPLIT: return encode_kernel_mask::BYTE_STREAM_SPLIT;
+      case column_encoding::PLAIN_V2: return encode_kernel_mask::PLAIN_V2;
     }
   }
 
@@ -2497,7 +2499,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 //   | concatenated byte data (length given by unencoded_byte_array_data_bytes) |
 //   | offsets (length (num_non_nulls + 1) * byte_width) |
 //   | byte_width (1 byte, can be 0-4, 2GB page limit) |
-// 
+//
 // we should have enough page data for char data + num_non_nulls * 4 + 1
 // so first copy lengths into start of buffer, then do exclusive sum to
 // convert to offsets. from max offset calculate number of bytes needed for
@@ -2516,7 +2518,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   __shared__ uint8_t const* first_string;
   __shared__ size_type string_data_len;
   using block_scan = cub::BlockScan<size_type, block_size>;
-  typename block_scan::TempStorage tmp_storage;
+  __shared__ typename block_scan::TempStorage temp_storage;
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -2571,9 +2573,10 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   __syncthreads();
 
   // copy lengths into buffer
-  size_type* lengths = static_cast<size_type*>(s->cur);
+  auto lengths = reinterpret_cast<size_type*>(s->cur);
   // align to 4 byte boundary
-  lengths = util::round_up_safe(reinterpret_cast<std::uintptr_t>(lengths), sizeof(size_type));
+  lengths = reinterpret_cast<size_type*>(
+    util::round_up_safe(reinterpret_cast<std::uintptr_t>(lengths), sizeof(size_type)));
   size_type valid_count = 0;
 
   for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
@@ -2590,6 +2593,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
     cur_val_idx += nvals;
 
     size_type pos, num_valid;
+    size_type const valid = is_valid;
     block_scan(temp_storage).ExclusiveSum(valid, pos, num_valid);
 
     int32_t v = 0;
@@ -2613,13 +2617,13 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   }
 
   // excl scan lengths to get offsets
-  block_excl_sum(lengths, valid_count + 1, 0);
+  block_excl_sum<block_size>(lengths, valid_count + 1, 0);
 
   if (t == 0) { string_data_len = lengths[valid_count]; }
   __syncthreads();
 
-  int bit_width = 32 - __clz(string_data_len);
-  int byte_width = util::round_up_safe(bit_width, 8);
+  int bit_width  = 32 - __clz(string_data_len);
+  int byte_width = util::div_rounding_up_safe(bit_width, 8);
 
   // now copy offsets into proper location
   auto offs = s->cur + string_data_len;
@@ -2636,13 +2640,12 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 
   // save byte width
   offs[byte_width * (valid_count + 1)] = byte_width;
-  auto const end_ptr = &offs[byte_width * (valid_count + 1) + 1];
+  auto const end_ptr                   = &offs[byte_width * (valid_count + 1) + 1];
 
   // now copy the char data
   memcpy_block<block_size, true>(s->cur, first_string, string_data_len, t);
 
-  finish_page_encode<block_size>(
-    s, end_ptr, pages, comp_in, comp_out, comp_results, true);
+  finish_page_encode<block_size>(s, end_ptr, pages, comp_in, comp_out, comp_results, true);
 }
 
 constexpr int decide_compression_warps_in_block = 4;
@@ -3640,6 +3643,13 @@ void EncodePages(device_span<EncPage> pages,
       pages, write_v2_headers, encode_kernel_mask::DICTIONARY);
     gpuEncodeDictPages<encode_block_size><<<num_pages, encode_block_size, 0, strm.value()>>>(
       pages, comp_in, comp_out, comp_results, write_v2_headers);
+  }
+  if (BitAnd(kernel_mask, encode_kernel_mask::PLAIN_V2) != 0) {
+    auto const strm = streams[s_idx++];
+    gpuEncodePageLevels<encode_block_size><<<num_pages, encode_block_size, 0, strm.value()>>>(
+      pages, write_v2_headers, encode_kernel_mask::PLAIN_V2);
+    gpuEncodePlainV2Pages<encode_block_size>
+      <<<num_pages, encode_block_size, 0, strm.value()>>>(pages, comp_in, comp_out, comp_results);
   }
 
   cudf::detail::join_streams(streams, stream);

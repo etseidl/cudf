@@ -726,6 +726,7 @@ std::vector<schema_tree_node> construct_schema_tree(
 
             // supported parquet encodings
             case column_encoding::PLAIN:
+            case column_encoding::PLAIN_V2:
             case column_encoding::DICTIONARY: break;
 
             // all others
