@@ -216,6 +216,7 @@ enum class decode_kernel_mask {
   FIXED_WIDTH_DICT       = (1 << 6),  // Run decode kernel for fixed width dictionary pages
   BYTE_STREAM_SPLIT      = (1 << 7),  // Run decode kernel for BYTE_STREAM_SPLIT encoded data
   BYTE_STREAM_SPLIT_FLAT = (1 << 8),  // Same as above but with a flat schema
+  PLAIN_V2               = (1 << 9),
 };
 
 // mask representing all the ways in which a string can be encoded
