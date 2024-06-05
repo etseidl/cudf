@@ -704,6 +704,9 @@ CUDF_KERNEL void __launch_bounds__(128)
     auto const rle_pad =
       write_v2_headers && col_g.physical_type == BOOLEAN ? RLE_LENGTH_FIELD_LEN : 0;
 
+    // plain v2 needs extra byte for the byte_width
+    int const plain_pad = column_data_encoding == encode_kernel_mask::PLAIN_V2;
+
     // This loop goes over one page fragment at a time and adds it to page.
     // When page size crosses a particular limit, then it moves on to the next page and then next
     // page fragment gets added to that one.
@@ -811,7 +814,7 @@ CUDF_KERNEL void __launch_bounds__(128)
             page_size = max(page_size, delta_len);
           }
           auto const max_data_size =
-            page_size + rle_pad +
+            page_size + rle_pad + plain_pad +
             (write_v2_headers ? page_g.max_lvl_size : def_level_size + rep_level_size);
           // page size must fit in 32-bit signed integer
           if (max_data_size > std::numeric_limits<int32_t>::max()) {
@@ -2616,7 +2619,10 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
     valid_count += num_valid;
   }
 
-  // excl scan lengths to get offsets
+  // set valid_count+1th length to 0 since we'll do exclusive sum past valid_count
+  if (t == 0) { lengths[valid_count] = 0; }
+
+  // excl scan lengths to get offsets (adding 1 to get offset to end of buffer)
   block_excl_sum<block_size>(lengths, valid_count + 1, 0);
 
   if (t == 0) { string_data_len = lengths[valid_count]; }
