@@ -704,8 +704,8 @@ CUDF_KERNEL void __launch_bounds__(128)
     auto const rle_pad =
       write_v2_headers && col_g.physical_type == BOOLEAN ? RLE_LENGTH_FIELD_LEN : 0;
 
-    // plain v2 needs extra byte for the byte_width
-    int const plain_pad = column_data_encoding == encode_kernel_mask::PLAIN_V2;
+    // plain v2 needs extra byte for the byte_width + 4 bytes of num_values
+    auto const plain_pad = column_data_encoding == encode_kernel_mask::PLAIN_V2 ? 5 : 0;
 
     // This loop goes over one page fragment at a time and adds it to page.
     // When page size crosses a particular limit, then it moves on to the next page and then next
@@ -2497,10 +2497,12 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 // experimental (name tbd) page data encoder
 // proposed on parquet M/L as RANDOM_ACCESS_BYTE_ARRAY
 // this encoding allows for random access in the absence of nulls
+// modified to add num_values since v1 page header lacks null count
 //
 // format is:
 //   | concatenated byte data (length given by unencoded_byte_array_data_bytes) |
-//   | offsets (length (num_non_nulls + 1) * byte_width) |
+//   | offsets (length (num_values + 1) * byte_width) |
+//   | num_values (4 byte, number of encoded string values) |
 //   | byte_width (1 byte, can be 0-4, 2GB page limit) |
 //
 // we should have enough page data for char data + num_non_nulls * 4 + 1
@@ -2644,14 +2646,19 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
     }
   }
 
-  // save byte width
-  offs[byte_width * (valid_count + 1)] = byte_width;
-  auto const end_ptr                   = &offs[byte_width * (valid_count + 1) + 1];
+  // save num_values and byte width
+  auto const end_of_offsets = &offs[byte_width * (valid_count + 1)];
+  end_of_offsets[0]         = valid_count & 0xff;
+  end_of_offsets[1]         = (valid_count >> 8) & 0xff;
+  end_of_offsets[2]         = (valid_count >> 16) & 0xff;
+  end_of_offsets[3]         = (valid_count >> 24) & 0xff;
+  end_of_offsets[4]         = byte_width;
 
   // now copy the char data
   memcpy_block<block_size, true>(s->cur, first_string, string_data_len, t);
 
-  finish_page_encode<block_size>(s, end_ptr, pages, comp_in, comp_out, comp_results, true);
+  finish_page_encode<block_size>(
+    s, end_of_offsets + 5, pages, comp_in, comp_out, comp_results, true);
 }
 
 constexpr int decide_compression_warps_in_block = 4;

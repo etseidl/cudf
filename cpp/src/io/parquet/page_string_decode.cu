@@ -19,6 +19,7 @@
 #include "page_decode.cuh"
 #include "page_string_utils.cuh"
 #include "rle_stream.cuh"
+#include "thrust/distance.h"
 
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -1146,8 +1147,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   using cudf::detail::warp_size;
   __shared__ __align__(16) page_state_s state_g;
   __shared__ __align__(16) page_state_buffers_s<decode_block_size, 1, 1> state_buffers;
-  __shared__ __align__(8) uint8_t const* page_string_data;
-  __shared__ size_t string_offset;
 
   page_state_s* const s = &state_g;
   auto* const sb        = &state_buffers;
@@ -1167,50 +1166,45 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     return;
   }
 
-  // copy of DLBA decoder...needs lots ripped out.
-  // start at end of buffer, get byte_width,
-  // then backtrack bw * num_non_null to get to start of offsets array
-  // if skip rows, figure out offset of first value we want
-  // if num rows figure out offset of end of last value
-  // copy offsets into column buffer (or convert offsets to lengths to re-use code?)
-  // copy string data into column buffer
-
+  size_t string_offset      = 0;
   bool const has_repetition = s->col.max_level[level_type::REPETITION] > 0;
 
   // copying logic from gpuDecodePageData.
   PageNestingDecodeInfo const* nesting_info_base = s->nesting_info;
 
-  __shared__ level_t rep[delta_rolling_buf_size];  // circular buffer of repetition level values
-  __shared__ level_t def[delta_rolling_buf_size];  // circular buffer of definition level values
+  __shared__ level_t rep[rolling_buf_size];  // circular buffer of repetition level values
+  __shared__ level_t def[rolling_buf_size];  // circular buffer of definition level values
 
   // skipped_leaf_values will always be 0 for flat hierarchies.
   uint32_t const skipped_leaf_values = s->page.skipped_leaf_values;
 
-  // initialize delta state
-  if (t == 0) { string_offset = 0; }
-  __syncthreads();
-
   int const leaf_level_index = s->col.max_nesting_depth - 1;
-  auto const batch_size      = decode_block_size;
+  auto const batch_size      = 3 * warp_size;
+
+  // find byte width and offsets array start. byte width is last byte in page data.
+  // offsets begin byte_width * num_valid bytes before that.
+  auto const data_len = thrust::distance(s->data_start, s->data_end);
+  // point to start of num_values | byte_width
+  auto const len_bw     = s->data_start + data_len - 5;
+  auto const byte_width = len_bw[4];
+  auto const num_values_in_page =
+    len_bw[0] | (len_bw[1] << 8) | (len_bw[2] << 16) | (len_bw[3] << 24);
+  auto const offsets_len = byte_width * (num_values_in_page + 1);
+  auto const offsets     = len_bw - offsets_len;
+
+  auto offset_at = [&](int idx) {
+    auto ptr = offsets + idx * byte_width;
+    int res  = 0;
+    for (int i = 0; i < byte_width; i++) {
+      res |= ptr[i] << (8 * i);
+    }
+  };
 
   // if this is a bounds page, then we need to decode up to the first mini-block
   // that has a value we need, and set string_offset to the position of the first value in the
   // string data block.
   auto const is_bounds_pg = is_bounds_page(s, min_row, num_rows, has_repetition);
-  if (is_bounds_pg && s->page.start_val > 0) {
-    if (t < warp_size) {
-      // string_off is only valid on thread 0
-      auto const string_off = db->skip_values_and_sum(s->page.start_val);
-      if (t == 0) {
-        string_offset = string_off;
-
-        // if there is no repetition, then we need to work through the whole page, so reset the
-        // delta decoder to the beginning of the page
-        if (not has_repetition) { db->init_binary_block(s->data_start, s->data_end); }
-      }
-    }
-    __syncthreads();
-  }
+  if (is_bounds_pg && s->page.start_val > 0) { string_offset = offset_at(s->page.start_val); }
 
   int string_pos = has_repetition ? s->page.start_val : 0;
 
@@ -1226,10 +1220,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     // this needs to be here to prevent warp 2 modifying src_pos before all threads have read it
     __syncthreads();
 
-    // warp0 will decode the rep/def levels, warp1 will unpack a mini-batch of deltas.
-    // warp2 waits one cycle for warps 0/1 to produce a batch, and then stuffs string sizes
-    // into the proper location in the output. warp 3 does nothing until it's time to copy
-    // string data.
+    // warp0 will decode the rep/def levels, warps 1..3 will write lengths to the output.
     if (t < warp_size) {
       // warp 0
       // decode repetition and definition levels.
@@ -1237,30 +1228,29 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
       // - updates offsets (for nested columns)
       // - produces non-NULL value indices in s->nz_idx for subsequent decoding
       gpuDecodeLevels<delta_rolling_buf_size, level_t>(s, sb, target_pos, rep, def, t);
-    } else if (t < 2 * warp_size) {
-      // warp 1
-      db->decode_batch();
 
-    } else if (t < 3 * warp_size && src_pos < target_pos) {
-      // warp 2
+    } else if (src_pos < target_pos) {
+      // warp 1..3
       int const nproc = min(batch_size, s->page.end_val - string_pos);
       string_pos += nproc;
 
-      // process the mini-block in batches of 32
-      for (uint32_t sp = src_pos + lane_id; sp < src_pos + batch_size; sp += 32) {
+      // src_pos for this thread
+      int const sp = src_pos + t - warp_size;
+
+      if (sp < target_pos) {
         // the position in the output column/buffer
-        int dst_pos = sb->nz_idx[rolling_index<delta_rolling_buf_size>(sp)];
+        int dst_pos = sb->nz_idx[rolling_index<rolling_buf_size>(sp)];
 
         // handle skip_rows here. flat hierarchies can just skip up to first_row.
         if (!has_repetition) { dst_pos -= s->first_row; }
 
-        // fill in offsets array
-        if (dst_pos >= 0 && sp < target_pos) {
+        // fill in offsets array. even though we have offsets already, use lengths to be
+        // consistent with other decoders. this also simplifies null handling.
+        if (dst_pos >= 0) {
           auto const offptr =
             reinterpret_cast<size_type*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
-          *offptr = db->value_at(sp + skipped_leaf_values);
+          *offptr = offset_at(dst_pos + 1) - offset_at(dst_pos);
         }
-        __syncwarp();
       }
 
       if (lane_id == 0) { s->src_pos = src_pos + batch_size; }
@@ -1283,7 +1273,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
 
   // finally, copy the string data into place
   auto const dst = nesting_info_base[leaf_level_index].string_out;
-  auto const src = page_string_data + string_offset;
+  auto const src = s->data_start + string_offset;
   memcpy_block<decode_block_size, true>(dst, src, s->page.str_bytes, t);
 
   if (t == 0 and s->error != 0) { set_error(s->error, error_code); }
