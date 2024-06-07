@@ -476,6 +476,41 @@ __device__ size_t totalPlainEntriesSize(uint8_t const* data,
 }
 
 /**
+ * @brief Compute string size information for plain_v2 encoded strings.
+ *
+ * @param data Pointer to the start of the page data stream
+ * @param data_size Length of data
+ * @param start_value Do not count values that occur before this index
+ * @param end_value Do not count values that occur after this index
+ */
+__device__ size_t totalPlainV2EntriesSize(uint8_t const* data,
+                                          int data_size,
+                                          int start_value,
+                                          int end_value)
+{
+  // FIXME: add util method to return tuple of (byte_width, offsets_ptr)
+  // point to start of num_values | byte_width
+  auto const len_bw     = data + data_size - 5;
+  auto const byte_width = len_bw[4];
+  auto const num_values_in_page =
+    len_bw[0] | (len_bw[1] << 8) | (len_bw[2] << 16) | (len_bw[3] << 24);
+  auto const offsets_len = byte_width * (num_values_in_page + 1);
+  auto const offsets     = len_bw - offsets_len;
+
+  auto offset_at = [&](int idx) {
+    auto ptr = offsets + idx * byte_width;
+    int res  = 0;
+    for (int i = 0; i < byte_width; i++) {
+      res |= ptr[i] << (8 * i);
+    }
+    return res;
+  };
+
+  // TODO: if not bounds page can just return distance(data, offsets)
+  return offset_at(end_value) - offset_at(start_value);
+}
+
+/**
  * @brief Compute string size information for DELTA_BYTE_ARRAY encoded strings.
  *
  * This traverses the packed prefix and suffix lengths, summing them to obtain the total
@@ -860,12 +895,13 @@ CUDF_KERNEL void __launch_bounds__(preprocess_block_size) gpuComputePageStringSi
   bool const has_repetition = chunks[pp->chunk_idx].max_level[level_type::REPETITION] > 0;
 
   // setup page info
+  auto const kernel_mask = BitOr(decode_kernel_mask::STRING, decode_kernel_mask::PLAIN_V2);
   if (!setupLocalPageInfo(s,
                           pp,
                           chunks,
                           min_row,
                           num_rows,
-                          mask_filter{decode_kernel_mask::STRING},
+                          mask_filter{kernel_mask},
                           page_processing_stage::STRING_BOUNDS)) {
     return;
   }
@@ -920,6 +956,9 @@ CUDF_KERNEL void __launch_bounds__(preprocess_block_size) gpuComputePageStringSi
         str_bytes = is_bounds_pg ? totalPlainEntriesSize(data, dict_size, start_value, end_value)
                                  : dict_size - sizeof(int) * pp->num_valids;
         break;
+      case Encoding::PLAIN_V2:
+        dict_size = static_cast<int32_t>(end - data);
+        str_bytes = totalPlainV2EntriesSize(data, dict_size, start_value, end_value);
     }
   }
 
@@ -1146,7 +1185,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
 {
   using cudf::detail::warp_size;
   __shared__ __align__(16) page_state_s state_g;
-  __shared__ __align__(16) page_state_buffers_s<decode_block_size, 1, 1> state_buffers;
+  __shared__ __align__(16) page_state_buffers_s<rolling_buf_size, 1, 1> state_buffers;
 
   page_state_s* const s = &state_g;
   auto* const sb        = &state_buffers;
@@ -1198,7 +1237,11 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     for (int i = 0; i < byte_width; i++) {
       res |= ptr[i] << (8 * i);
     }
+    return res;
   };
+
+  // if (t==0) printf("bw %d numv %d data %p offs %p\n", byte_width, num_values_in_page,
+  // s->data_start, offsets);
 
   // if this is a bounds page, then we need to decode up to the first mini-block
   // that has a value we need, and set string_offset to the position of the first value in the
@@ -1212,11 +1255,12 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     uint32_t target_pos;
     uint32_t const src_pos = s->src_pos;
 
-    if (t < 2 * warp_size) {  // warp0..1
+    if (t < warp_size) {  // warp0
       target_pos = min(src_pos + 2 * batch_size, s->nz_count + batch_size);
-    } else {  // warp2
+    } else {  // warp1..3
       target_pos = min(s->nz_count, src_pos + batch_size);
     }
+    if (lane_id == 0) printf("%03d: target %d\n", t, target_pos);
     // this needs to be here to prevent warp 2 modifying src_pos before all threads have read it
     __syncthreads();
 
@@ -1227,7 +1271,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
       // - update validity vectors
       // - updates offsets (for nested columns)
       // - produces non-NULL value indices in s->nz_idx for subsequent decoding
-      gpuDecodeLevels<delta_rolling_buf_size, level_t>(s, sb, target_pos, rep, def, t);
+      gpuDecodeLevels<rolling_buf_size, level_t>(s, sb, target_pos, rep, def, t);
 
     } else if (src_pos < target_pos) {
       // warp 1..3
@@ -1249,7 +1293,10 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
         if (dst_pos >= 0) {
           auto const offptr =
             reinterpret_cast<size_type*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
-          *offptr = offset_at(dst_pos + 1) - offset_at(dst_pos);
+          auto const src_idx = sp + skipped_leaf_values;
+          *offptr            = offset_at(src_idx + 1) - offset_at(src_idx);
+
+          // printf("%03d: sp %d dp %d si %d len %d\n", t, sp, dst_pos, src_idx, *offptr);
         }
       }
 
@@ -1332,7 +1379,7 @@ void ComputePageStringSizes(cudf::detail::hostdevice_span<PageInfo> pages,
     gpuComputeDeltaLengthPageStringSizes<<<dim_grid, dim_delta, 0, streams[s_idx++].value()>>>(
       pages.device_ptr(), chunks, min_row, num_rows);
   }
-  if (BitAnd(kernel_mask, decode_kernel_mask::STRING) != 0) {
+  if ((kernel_mask & BitOr(decode_kernel_mask::STRING, decode_kernel_mask::PLAIN_V2)) != 0) {
     gpuComputePageStringSizes<<<dim_grid, dim_block, 0, streams[s_idx++].value()>>>(
       pages.device_ptr(), chunks, min_row, num_rows);
   }
@@ -1404,6 +1451,31 @@ void __host__ DecodeStringPageData(cudf::detail::hostdevice_span<PageInfo> pages
       pages.device_ptr(), chunks, min_row, num_rows, error_code);
   } else {
     gpuDecodeStringPageData<uint16_t><<<dim_grid, dim_block, 0, stream.value()>>>(
+      pages.device_ptr(), chunks, min_row, num_rows, error_code);
+  }
+}
+
+/**
+ * @copydoc cudf::io::parquet::detail::DecodePlainV2
+ */
+void __host__ DecodePlainV2(cudf::detail::hostdevice_span<PageInfo> pages,
+                            cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
+                            size_t num_rows,
+                            size_t min_row,
+                            int level_type_size,
+                            kernel_error::pointer error_code,
+                            rmm::cuda_stream_view stream)
+{
+  CUDF_EXPECTS(pages.size() > 0, "There is no page to decode");
+
+  dim3 dim_block(decode_block_size, 1);
+  dim3 dim_grid(pages.size(), 1);  // 1 threadblock per page
+
+  if (level_type_size == 1) {
+    gpuDecodePlainV2<uint8_t><<<dim_grid, dim_block, 0, stream.value()>>>(
+      pages.device_ptr(), chunks, min_row, num_rows, error_code);
+  } else {
+    gpuDecodePlainV2<uint16_t><<<dim_grid, dim_block, 0, stream.value()>>>(
       pages.device_ptr(), chunks, min_row, num_rows, error_code);
   }
 }

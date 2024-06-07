@@ -173,6 +173,8 @@ __device__ decode_kernel_mask kernel_mask_for_page(PageInfo const& page,
     return decode_kernel_mask::DELTA_BYTE_ARRAY;
   } else if (page.encoding == Encoding::DELTA_LENGTH_BYTE_ARRAY) {
     return decode_kernel_mask::DELTA_LENGTH_BA;
+  } else if (page.encoding == Encoding::PLAIN_V2) {
+    return decode_kernel_mask::PLAIN_V2;
   } else if (is_string_col(chunk)) {
     // check for string before byte_stream_split so FLBA will go to the right kernel
     return decode_kernel_mask::STRING;

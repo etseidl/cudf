@@ -17,6 +17,7 @@
 #include "reader_impl.hpp"
 
 #include "error.hpp"
+#include "io/parquet/parquet_gpu.hpp"
 
 #include <cudf/detail/stream_compaction.hpp>
 #include <cudf/detail/transform.hpp>
@@ -231,6 +232,16 @@ void reader::impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num
                          level_type_size,
                          error_code.data(),
                          streams[s_idx++]);
+  }
+
+  if (BitAnd(kernel_mask, decode_kernel_mask::PLAIN_V2) != 0) {
+    DecodePlainV2(subpass.pages,
+                  pass.chunks,
+                  num_rows,
+                  skip_rows,
+                  level_type_size,
+                  error_code.data(),
+                  streams[s_idx++]);
   }
 
   // launch delta byte array decoder

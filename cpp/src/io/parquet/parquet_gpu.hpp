@@ -88,7 +88,8 @@ constexpr bool is_supported_encoding(Encoding enc)
     case Encoding::DELTA_BINARY_PACKED:
     case Encoding::DELTA_LENGTH_BYTE_ARRAY:
     case Encoding::DELTA_BYTE_ARRAY:
-    case Encoding::BYTE_STREAM_SPLIT: return true;
+    case Encoding::BYTE_STREAM_SPLIT:
+    case Encoding::PLAIN_V2: return true;
     default: return false;
   }
 }
@@ -221,8 +222,9 @@ enum class decode_kernel_mask {
 
 // mask representing all the ways in which a string can be encoded
 constexpr uint32_t STRINGS_MASK =
-  BitOr(BitOr(decode_kernel_mask::DELTA_BYTE_ARRAY, decode_kernel_mask::STRING),
-        decode_kernel_mask::DELTA_LENGTH_BA);
+  BitOr(BitOr(BitOr(decode_kernel_mask::DELTA_BYTE_ARRAY, decode_kernel_mask::STRING),
+              decode_kernel_mask::DELTA_LENGTH_BA),
+        decode_kernel_mask::PLAIN_V2);
 /**
  * @brief Nesting information specifically needed by the decode and preprocessing
  * kernels.
@@ -817,6 +819,28 @@ void DecodeStringPageData(cudf::detail::hostdevice_span<PageInfo> pages,
                           int level_type_size,
                           kernel_error::pointer error_code,
                           rmm::cuda_stream_view stream);
+
+/**
+ * @brief Launches kernel for reading the string column data stored in the pages
+ *
+ * The page data will be written to the output pointed to in the page's
+ * associated column chunk.
+ *
+ * @param[in,out] pages All pages to be decoded
+ * @param[in] chunks All chunks to be decoded
+ * @param[in] num_rows Total number of rows to read
+ * @param[in] min_row Minimum number of rows to read
+ * @param[in] level_type_size Size in bytes of the type for level decoding
+ * @param[out] error_code Error code for kernel failures
+ * @param[in] stream CUDA stream to use
+ */
+void DecodePlainV2(cudf::detail::hostdevice_span<PageInfo> pages,
+                   cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
+                   size_t num_rows,
+                   size_t min_row,
+                   int level_type_size,
+                   kernel_error::pointer error_code,
+                   rmm::cuda_stream_view stream);
 
 /**
  * @brief Launches kernel for reading the DELTA_BINARY_PACKED column data stored in the pages

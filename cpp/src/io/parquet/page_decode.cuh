@@ -1335,6 +1335,7 @@ inline __device__ bool setupLocalPageInfo(page_state_s* const s,
         case Encoding::DELTA_BINARY_PACKED:
         case Encoding::DELTA_LENGTH_BYTE_ARRAY:
         case Encoding::DELTA_BYTE_ARRAY:
+        case Encoding::PLAIN_V2:
           // nothing to do, just don't error
           break;
         default: {
