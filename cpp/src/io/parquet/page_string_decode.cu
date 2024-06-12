@@ -1240,9 +1240,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     return res;
   };
 
-  // if (t==0) printf("bw %d numv %d data %p offs %p\n", byte_width, num_values_in_page,
-  // s->data_start, offsets);
-
   // if this is a bounds page, then we need to decode up to the first mini-block
   // that has a value we need, and set string_offset to the position of the first value in the
   // string data block.
@@ -1260,7 +1257,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     } else {  // warp1..3
       target_pos = min(s->nz_count, src_pos + batch_size);
     }
-    if (lane_id == 0) printf("%03d: target %d\n", t, target_pos);
     // this needs to be here to prevent warp 2 modifying src_pos before all threads have read it
     __syncthreads();
 
@@ -1295,8 +1291,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
             reinterpret_cast<size_type*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
           auto const src_idx = sp + skipped_leaf_values;
           *offptr            = offset_at(src_idx + 1) - offset_at(src_idx);
-
-          // printf("%03d: sp %d dp %d si %d len %d\n", t, sp, dst_pos, src_idx, *offptr);
         }
       }
 
