@@ -2626,6 +2626,8 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 
   // excl scan lengths to get offsets (adding 1 to get offset to end of buffer)
   block_excl_sum<block_size>(lengths, valid_count + 1, 0);
+  // ensure all threads have written to lengths
+  __syncthreads();
 
   if (t == 0) { string_data_len = lengths[valid_count]; }
   __syncthreads();
