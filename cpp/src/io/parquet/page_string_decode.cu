@@ -1240,13 +1240,9 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
     return res;
   };
 
-  // if this is a bounds page, then we need to decode up to the first mini-block
-  // that has a value we need, and set string_offset to the position of the first value in the
-  // string data block.
+  // if this is a bounds page, then find the offset of the first string to decode
   auto const is_bounds_pg = is_bounds_page(s, min_row, num_rows, has_repetition);
   if (is_bounds_pg && s->page.start_val > 0) { string_offset = offset_at(s->page.start_val); }
-
-  int string_pos = has_repetition ? s->page.start_val : 0;
 
   while (!s->error && (s->input_value_count < s->num_input_values || s->src_pos < s->nz_count)) {
     uint32_t target_pos;
@@ -1271,9 +1267,6 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
 
     } else if (src_pos < target_pos) {
       // warp 1..3
-      int const nproc = min(batch_size, s->page.end_val - string_pos);
-      string_pos += nproc;
-
       // src_pos for this thread
       int const sp = src_pos + t - warp_size;
 
