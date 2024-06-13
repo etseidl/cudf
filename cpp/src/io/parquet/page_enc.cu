@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include "cub/block/block_reduce.cuh"
 #include "cudf/io/types.hpp"
+#include "cudf/types.hpp"
 #include "delta_enc.cuh"
 #include "io/parquet/parquet_gpu.hpp"
 #include "io/utilities/block_utils.cuh"
@@ -2501,7 +2503,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 //
 // format is:
 //   | concatenated byte data (length given by unencoded_byte_array_data_bytes) |
-//   | offsets (length (num_values + 1) * byte_width) |
+//   | lengths (length num_values * byte_width) |
 //   | num_values (4 byte, number of encoded string values) |
 //   | byte_width (1 byte, can be 0-4, 2GB page limit) |
 //
@@ -2521,9 +2523,11 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 {
   __shared__ __align__(8) page_enc_state_s<0> state_g;
   __shared__ uint8_t const* first_string;
-  __shared__ size_type string_data_len;
-  using block_scan = cub::BlockScan<size_type, block_size>;
+  __shared__ size_type string_data_len, max_string_len;
+  using block_scan   = cub::BlockScan<size_type, block_size>;
+  using block_reduce = cub::BlockReduce<size_type, block_size>;
   __shared__ typename block_scan::TempStorage temp_storage;
+  __shared__ typename block_reduce::TempStorage reduce_temp;
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -2583,6 +2587,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   lengths = reinterpret_cast<size_type*>(
     util::round_up_safe(reinterpret_cast<std::uintptr_t>(lengths), sizeof(size_type)));
   size_type valid_count = 0;
+  size_type string_len  = 0;
 
   for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
     uint32_t const nvals = min(s->page.num_leaf_values - cur_val_idx, block_size);
@@ -2618,28 +2623,34 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
       lengths[valid_count + pos] = v;
     }
 
+    string_len += v;
     valid_count += num_valid;
   }
-
-  // set valid_count+1th length to 0 since we'll do exclusive sum past valid_count
-  if (t == 0) { lengths[valid_count] = 0; }
-
-  // excl scan lengths to get offsets (adding 1 to get offset to end of buffer)
-  block_excl_sum<block_size>(lengths, valid_count + 1, 0);
-  // ensure all threads have written to lengths
   __syncthreads();
 
-  if (t == 0) { string_data_len = lengths[valid_count]; }
+  auto const total_string_len = block_reduce(reduce_temp).Reduce(string_len, cub::Sum());
+  if (t == 0) {
+    string_data_len = total_string_len;
+    max_string_len  = 0;
+  }
   __syncthreads();
 
-  int bit_width  = 32 - __clz(string_data_len);
+  // find max string length
+  for (int i = 0; i < valid_count; i += block_size) {
+    auto const len     = i + t < valid_count ? lengths[i + t] : 0;
+    auto const max_len = block_reduce(reduce_temp).Reduce(len, cub::Max());
+    if (t == 0) { max_string_len = max(max_string_len, max_len); }
+    __syncthreads();
+  }
+
+  int bit_width  = 32 - __clz(max_string_len);
   int byte_width = util::div_rounding_up_safe(bit_width, 8);
 
-  // now copy offsets into proper location
+  // now copy lengths into proper location
   auto offs = s->cur + string_data_len;
 
-  // copy valid_count + 1 offsets into place
-  for (int i = t; i <= valid_count; i += block_size) {
+  // copy valid_count lengths into place
+  for (int i = t; i < valid_count; i += block_size) {
     auto len = lengths[i];
     auto off = i * byte_width;
     for (int b = 0; b < byte_width; b++, off++) {

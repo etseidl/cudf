@@ -1228,7 +1228,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
   auto const byte_width = len_bw[4];
   auto const num_values_in_page =
     len_bw[0] | (len_bw[1] << 8) | (len_bw[2] << 16) | (len_bw[3] << 24);
-  auto const offsets_len = byte_width * (num_values_in_page + 1);
+  auto const offsets_len = byte_width * num_values_in_page;
   auto const offsets     = len_bw - offsets_len;
 
   auto offset_at = [&](int idx) {
@@ -1290,7 +1290,7 @@ CUDF_KERNEL void __launch_bounds__(decode_block_size)
           auto const offptr =
             reinterpret_cast<size_type*>(nesting_info_base[leaf_level_index].data_out) + dst_pos;
           auto const src_idx = sp + skipped_leaf_values;
-          *offptr            = offset_at(src_idx + 1) - offset_at(src_idx);
+          *offptr            = offset_at(src_idx);
         }
       }
 
