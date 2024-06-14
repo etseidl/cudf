@@ -296,19 +296,6 @@ size_t column_size(column_view const& column, rmm::cuda_stream_view stream)
   CUDF_FAIL("Unexpected compound type");
 }
 
-// checks to see if the given column has a fixed size.  This doesn't
-// check every row, so assumes string and list columns are not fixed, even
-// if each row is the same width.
-// TODO: update this if FIXED_LEN_BYTE_ARRAY is ever supported for writes.
-bool is_col_fixed_width(column_view const& column)
-{
-  if (column.type().id() == type_id::STRUCT) {
-    return std::all_of(column.child_begin(), column.child_end(), is_col_fixed_width);
-  }
-
-  return is_fixed_width(column.type());
-}
-
 /**
  * @brief Extends SchemaElement to add members required in constructing parquet_column_view
  *
@@ -945,6 +932,7 @@ struct parquet_column_view {
   {
     return schema_node.converted_type.value_or(UNKNOWN);
   }
+  [[nodiscard]] int type_length() const { return schema_node.type_length; }
 
   std::vector<std::string> const& get_path_in_schema() { return path_in_schema; }
 
@@ -1101,6 +1089,23 @@ parquet_column_device_view parquet_column_view::get_device_view(rmm::cuda_stream
   desc.requested_encoding = schema_node.requested_encoding;
   desc.skip_compression   = schema_node.skip_compression;
   return desc;
+}
+
+// checks to see if the given column has a fixed size.  This doesn't
+// check every row, so assumes string and list columns are not fixed, even
+// if each row is the same width.
+bool is_col_fixed_width(column_view const& column, parquet_column_view const& pq_column)
+{
+  if (column.type().id() == type_id::STRUCT) {
+    return std::all_of(column.child_begin(), column.child_end(), is_col_fixed_width);
+  }
+
+  // check for fixed length byte array
+  if (pq_column.physical_type() == Type::FIXED_LEN_BYTE_ARRAY) {
+    return pq_column.type_length() > 0;
+  }
+
+  return is_fixed_width(column.type());
 }
 
 /**
@@ -1763,8 +1768,13 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     // for multiple fragments per page to smooth things out. using 2 was too
     // unbalanced in final page sizes, so using 4 which seems to be a good
     // compromise at smoothing things out without getting fragment sizes too small.
-    auto frag_size_fn = [&](auto const& col, size_t col_size) {
-      int const target_frags_per_page = is_col_fixed_width(col) ? 1 : 4;
+    auto cols_iter = thrust::make_zip_iterator(single_streams_table.begin(), column_sizes.begin(), parquet_columns.begin());
+    auto cols_end = thrust::make_zip_iterator(single_streams_table.end(), column_sizes.end(), parquet_columns.end());
+    auto frag_size_fn = [&](auto const& cols_tuple) {
+      auto const& col = thrust::get<0>(cols_tuple);
+      size_t const col_size = thrust::get<1>(cols_tuple);
+      auto const& pq_col = thrust::get<2>(cols_tuple);
+      int const target_frags_per_page = is_col_fixed_width(col, pq_col) ? 1 : 4;
       auto const avg_len =
         target_frags_per_page * util::div_rounding_up_safe<size_t>(col_size, input.num_rows());
       if (avg_len > 0) {
@@ -1775,11 +1785,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
       }
     };
 
-    std::transform(single_streams_table.begin(),
-                   single_streams_table.end(),
-                   column_sizes.begin(),
-                   column_frag_size.begin(),
-                   frag_size_fn);
+    std::transform(cols_iter, cols_end, column_frag_size.begin(), frag_size_fn);
   }
 
   // Fragments are calculated in two passes. In the first pass, a uniform number of fragments
