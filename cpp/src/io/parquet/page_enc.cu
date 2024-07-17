@@ -15,6 +15,7 @@
  */
 
 #include "delta_enc.cuh"
+#include "io/parquet/parquet_common.hpp"
 #include "io/parquet/parquet_gpu.hpp"
 #include "io/utilities/block_utils.cuh"
 #include "page_string_utils.cuh"
@@ -508,6 +509,8 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
     return encode_kernel_mask::DICTIONARY;
   }
 
+  // TODO: split PLAIN BYTE_ARRAY into its own kernel?
+
   // next check for user requested encoding, but skip if user requested dictionary encoding
   // (if we could use the requested dict encoding, we'd have returned above)
   if (col_desc->requested_encoding != column_encoding::USE_DEFAULT and
@@ -518,6 +521,7 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
       case column_encoding::DELTA_LENGTH_BYTE_ARRAY: return encode_kernel_mask::DELTA_LENGTH_BA;
       case column_encoding::DELTA_BYTE_ARRAY: return encode_kernel_mask::DELTA_BYTE_ARRAY;
       case column_encoding::BYTE_STREAM_SPLIT: return encode_kernel_mask::BYTE_STREAM_SPLIT;
+      default: break;
     }
   }
 
@@ -529,6 +533,7 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
       case INT32:
       case INT64: return encode_kernel_mask::DELTA_BINARY;
       case BYTE_ARRAY: return encode_kernel_mask::DELTA_LENGTH_BA;
+      default: break;
     }
   }
 
@@ -1638,8 +1643,10 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
                  bool is_split_stream)
 {
   __shared__ __align__(8) page_enc_state_s<0> state_g;
-  using block_scan = cub::BlockScan<uint32_t, block_size>;
+  using block_scan   = cub::BlockScan<uint32_t, block_size>;
+  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
   __shared__ typename block_scan::TempStorage scan_storage;
+  __shared__ typename block_reduce::TempStorage reduce_storage;  // TODO: use union
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -1710,8 +1717,6 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
       return std::make_tuple(is_valid, val_idx);
     }();
 
-    cur_val_idx += nvals;
-
     // Non-dictionary encoding
     uint8_t* dst = s->cur;
 
@@ -1739,7 +1744,83 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
     }
 
     if (t == 0) { s->cur = dst + total_len; }
-    if (is_valid) {
+
+    if (physical_type == BYTE_ARRAY) {
+      __shared__ uint32_t num_valid;
+      auto const valids = block_reduce(reduce_storage).Sum(is_valid);
+      if (t == 0) { num_valid = valids; }
+      __syncthreads();
+
+      bool const large_strings = ((total_len - num_valid * 4) / num_valid) > 32;
+
+      auto const get_bytes = [](cudf::type_id const type_id,
+                                column_device_view const* leaf_column,
+                                uint32_t const val_idx) -> void const* {
+        switch (type_id) {
+          case type_id::STRING:
+            return reinterpret_cast<void const*>(leaf_column->element<string_view>(val_idx).data());
+          case type_id::LIST:
+            return reinterpret_cast<void const*>(
+              get_element<statistics::byte_array_view>(*(leaf_column), val_idx).data());
+          default: CUDF_UNREACHABLE("invalid type id for byte array writing!");
+        }
+      };
+
+      if constexpr (false) {
+        if (large_strings) printf("ho\n");
+        // if (t==0) printf("large tot %d nv %d\n", total_len, num_valid);
+        //  for now duplicate
+        uint32_t lpos = 0;
+        for (int idx = 0; idx < nvals; idx++) {
+          auto [is_valid, val_idx] = [&]() {
+            uint32_t val_idx;
+            uint32_t is_valid;
+
+            size_type const val_idx_in_block = cur_val_idx + idx;
+            if (s->page.page_type == PageType::DICTIONARY_PAGE) {
+              val_idx  = val_idx_in_block;
+              is_valid = (val_idx < s->page.num_leaf_values);
+              if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
+            } else {
+              size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
+
+              is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
+                          val_idx_in_block < s->page.num_leaf_values)
+                           ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
+                           : 0;
+              val_idx  = val_idx_in_leaf_col;
+            }
+            return std::make_tuple(is_valid, val_idx);
+          }();
+
+          if (is_valid) {
+            len = dtype_len_out;
+            if (type_id == type_id::STRING) {
+              len += s->col.leaf_column->element<string_view>(val_idx).size_bytes();
+            } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+              len +=
+                get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx).size_bytes();
+            }
+
+            auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
+            uint32_t v       = len - 4;  // string length
+            encode_value(dst + lpos, v, 1);
+            // parallel memcpy
+            if (v != 0) { memcpy_block<block_size, true>(dst + lpos + 4, bytes, v, t); }
+            lpos += len;
+          }
+        }
+
+      } else {
+        // only PLAIN encoding is supported
+        if (is_valid) {
+          auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
+          uint32_t v       = len - 4;  // string length
+          encode_value(dst + pos, v, 1);
+          if (v != 0) memcpy(dst + pos + 4, bytes, v);
+        }
+      }
+    } else if (is_valid) {
       switch (physical_type) {
         case INT32: [[fallthrough]];
         case FLOAT: {
@@ -1793,6 +1874,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
               case type_id::TIMESTAMP_NANOSECONDS: {
                 return julian_days_with_time<cuda::std::micro>(v);
               } break;
+              default: break;
             }
             return julian_days_with_time<cuda::std::nano>(0);
           }();
@@ -1855,6 +1937,8 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
         } break;
       }
     }
+
+    cur_val_idx += nvals;
     __syncthreads();
   }
 
