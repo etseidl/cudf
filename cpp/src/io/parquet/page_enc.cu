@@ -509,14 +509,15 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
     return encode_kernel_mask::DICTIONARY;
   }
 
-  // TODO: split PLAIN BYTE_ARRAY into its own kernel?
+  auto const plain = col_desc->physical_type == BYTE_ARRAY ? encode_kernel_mask::PLAIN_BYTE_ARRAY
+                                                           : encode_kernel_mask::PLAIN;
 
   // next check for user requested encoding, but skip if user requested dictionary encoding
   // (if we could use the requested dict encoding, we'd have returned above)
   if (col_desc->requested_encoding != column_encoding::USE_DEFAULT and
       col_desc->requested_encoding != column_encoding::DICTIONARY) {
     switch (col_desc->requested_encoding) {
-      case column_encoding::PLAIN: return encode_kernel_mask::PLAIN;
+      case column_encoding::PLAIN: return plain;
       case column_encoding::DELTA_BINARY_PACKED: return encode_kernel_mask::DELTA_BINARY;
       case column_encoding::DELTA_LENGTH_BYTE_ARRAY: return encode_kernel_mask::DELTA_LENGTH_BA;
       case column_encoding::DELTA_BYTE_ARRAY: return encode_kernel_mask::DELTA_BYTE_ARRAY;
@@ -537,7 +538,7 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
     }
   }
 
-  return encode_kernel_mask::PLAIN;
+  return plain;
 }
 
 __device__ size_t delta_data_len(Type physical_type,
@@ -1643,10 +1644,8 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
                  bool is_split_stream)
 {
   __shared__ __align__(8) page_enc_state_s<0> state_g;
-  using block_scan   = cub::BlockScan<uint32_t, block_size>;
-  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
+  using block_scan = cub::BlockScan<uint32_t, block_size>;
   __shared__ typename block_scan::TempStorage scan_storage;
-  __shared__ typename block_reduce::TempStorage reduce_storage;  // TODO: use union
 
   auto* const s = &state_g;
   uint32_t t    = threadIdx.x;
@@ -1717,6 +1716,8 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
       return std::make_tuple(is_valid, val_idx);
     }();
 
+    cur_val_idx += nvals;
+
     // Non-dictionary encoding
     uint8_t* dst = s->cur;
 
@@ -1744,83 +1745,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
     }
 
     if (t == 0) { s->cur = dst + total_len; }
-
-    if (physical_type == BYTE_ARRAY) {
-      __shared__ uint32_t num_valid;
-      auto const valids = block_reduce(reduce_storage).Sum(is_valid);
-      if (t == 0) { num_valid = valids; }
-      __syncthreads();
-
-      bool const large_strings = ((total_len - num_valid * 4) / num_valid) > 32;
-
-      auto const get_bytes = [](cudf::type_id const type_id,
-                                column_device_view const* leaf_column,
-                                uint32_t const val_idx) -> void const* {
-        switch (type_id) {
-          case type_id::STRING:
-            return reinterpret_cast<void const*>(leaf_column->element<string_view>(val_idx).data());
-          case type_id::LIST:
-            return reinterpret_cast<void const*>(
-              get_element<statistics::byte_array_view>(*(leaf_column), val_idx).data());
-          default: CUDF_UNREACHABLE("invalid type id for byte array writing!");
-        }
-      };
-
-      if constexpr (false) {
-        if (large_strings) printf("ho\n");
-        // if (t==0) printf("large tot %d nv %d\n", total_len, num_valid);
-        //  for now duplicate
-        uint32_t lpos = 0;
-        for (int idx = 0; idx < nvals; idx++) {
-          auto [is_valid, val_idx] = [&]() {
-            uint32_t val_idx;
-            uint32_t is_valid;
-
-            size_type const val_idx_in_block = cur_val_idx + idx;
-            if (s->page.page_type == PageType::DICTIONARY_PAGE) {
-              val_idx  = val_idx_in_block;
-              is_valid = (val_idx < s->page.num_leaf_values);
-              if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
-            } else {
-              size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
-
-              is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
-                          val_idx_in_block < s->page.num_leaf_values)
-                           ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
-                           : 0;
-              val_idx  = val_idx_in_leaf_col;
-            }
-            return std::make_tuple(is_valid, val_idx);
-          }();
-
-          if (is_valid) {
-            len = dtype_len_out;
-            if (type_id == type_id::STRING) {
-              len += s->col.leaf_column->element<string_view>(val_idx).size_bytes();
-            } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
-              len +=
-                get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx).size_bytes();
-            }
-
-            auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
-            uint32_t v       = len - 4;  // string length
-            encode_value(dst + lpos, v, 1);
-            // parallel memcpy
-            if (v != 0) { memcpy_block<block_size, true>(dst + lpos + 4, bytes, v, t); }
-            lpos += len;
-          }
-        }
-
-      } else {
-        // only PLAIN encoding is supported
-        if (is_valid) {
-          auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
-          uint32_t v       = len - 4;  // string length
-          encode_value(dst + pos, v, 1);
-          if (v != 0) memcpy(dst + pos + 4, bytes, v);
-        }
-      }
-    } else if (is_valid) {
+    if (is_valid) {
       switch (physical_type) {
         case INT32: [[fallthrough]];
         case FLOAT: {
@@ -1937,14 +1862,194 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
         } break;
       }
     }
-
-    cur_val_idx += nvals;
     __syncthreads();
   }
 
   // for BYTE_STREAM_SPLIT, s->cur now points to the end of the first stream.
   // need it to point to the end of the Nth stream.
   if (is_split_stream and t == 0) { s->cur += (dtype_len_out - 1) * s->page.num_valid; }
+  finish_page_encode<block_size>(
+    s, s->cur, pages, comp_in, comp_out, comp_results, write_v2_headers);
+}
+
+// PLAIN page data encoder
+// blockDim(128, 1, 1)
+template <int block_size>
+CUDF_KERNEL void __launch_bounds__(block_size, 8)
+  gpuEncodePlainStringPages(device_span<EncPage> pages,
+                            device_span<device_span<uint8_t const>> comp_in,
+                            device_span<device_span<uint8_t>> comp_out,
+                            device_span<compression_result> comp_results,
+                            bool write_v2_headers)
+{
+  __shared__ __align__(8) page_enc_state_s<0> state_g;
+  using block_scan   = cub::BlockScan<uint32_t, block_size>;
+  using block_reduce = cub::BlockReduce<uint32_t, block_size>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+  __shared__ typename block_reduce::TempStorage reduce_storage;  // TODO: use union
+
+  auto* const s = &state_g;
+  uint32_t t    = threadIdx.x;
+
+  if (t == 0) {
+    state_g        = page_enc_state_s<0>{};
+    s->page        = pages[blockIdx.x];
+    s->ck          = *s->page.chunk;
+    s->col         = *s->ck.col_desc;
+    s->rle_len_pos = nullptr;
+    // get s->cur back to where it was at the end of encoding the rep and def level data
+    set_page_data_start(s);
+  }
+  __syncthreads();
+
+  if (BitAnd(s->page.kernel_mask, encode_kernel_mask::PLAIN_BYTE_ARRAY) == 0) { return; }
+
+  // Encode data values
+  __syncthreads();
+  auto const physical_type = s->col.physical_type;
+  auto const type_id       = s->col.leaf_column->type().id();
+  auto const dtype_len_out = physical_type_len(physical_type, type_id, s->col.type_length);
+  auto const dtype_len_in  = [&]() -> uint32_t {
+    if (physical_type == INT32) { return int32_logical_len(type_id); }
+    if (physical_type == INT96) { return sizeof(int64_t); }
+    return dtype_len_out;
+  }();
+
+  if (t == 0) {
+    uint8_t* dst     = s->cur;
+    s->rle_run       = 0;
+    s->rle_pos       = 0;
+    s->rle_numvals   = 0;
+    s->rle_out       = dst;
+    s->page.encoding = determine_encoding(
+      s->page.page_type, physical_type, s->ck.use_dictionary, write_v2_headers, false);
+    s->page_start_val  = row_to_value_idx(s->page.start_row, s->col);
+    s->chunk_start_val = row_to_value_idx(s->ck.start_row, s->col);
+  }
+  __syncthreads();
+
+  for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
+    uint32_t nvals = min(s->page.num_leaf_values - cur_val_idx, block_size);
+    uint32_t len, pos;
+
+    auto [is_valid, val_idx] = [&]() {
+      uint32_t val_idx;
+      uint32_t is_valid;
+
+      size_type const val_idx_in_block = cur_val_idx + t;
+      if (s->page.page_type == PageType::DICTIONARY_PAGE) {
+        val_idx  = val_idx_in_block;
+        is_valid = (val_idx < s->page.num_leaf_values);
+        if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
+      } else {
+        size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
+
+        is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
+                    val_idx_in_block < s->page.num_leaf_values)
+                     ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
+                     : 0;
+        val_idx  = val_idx_in_leaf_col;
+      }
+      return std::make_tuple(is_valid, val_idx);
+    }();
+
+    // Non-dictionary encoding
+    uint8_t* dst = s->cur;
+
+    if (is_valid) {
+      len = dtype_len_out;
+      if (type_id == type_id::STRING) {
+        len += s->col.leaf_column->element<string_view>(val_idx).size_bytes();
+      } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+        len += get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx).size_bytes();
+      }
+    } else {
+      len = 0;
+    }
+    uint32_t total_len = 0;
+    block_scan(scan_storage).ExclusiveSum(len, pos, total_len);
+    __syncthreads();
+
+    if (t == 0) { s->cur = dst + total_len; }
+
+    __shared__ uint32_t num_valid;
+    auto const valids = block_reduce(reduce_storage).Sum(is_valid);
+    if (t == 0) { num_valid = valids; }
+    __syncthreads();
+
+    bool const large_strings = ((total_len - num_valid * 4) / num_valid) > 32;
+
+    auto const get_bytes = [](cudf::type_id const type_id,
+                              column_device_view const* leaf_column,
+                              uint32_t const val_idx) -> void const* {
+      switch (type_id) {
+        case type_id::STRING:
+          return reinterpret_cast<void const*>(leaf_column->element<string_view>(val_idx).data());
+        case type_id::LIST:
+          return reinterpret_cast<void const*>(
+            get_element<statistics::byte_array_view>(*(leaf_column), val_idx).data());
+        default: CUDF_UNREACHABLE("invalid type id for byte array writing!");
+      }
+    };
+
+    if (large_strings) {
+      // if (t==0) printf("large tot %d nv %d\n", total_len, num_valid);
+      //  for now duplicate
+      uint32_t lpos = 0;
+      for (int idx = 0; idx < nvals; idx++) {
+        auto [is_valid, val_idx] = [&]() {
+          uint32_t val_idx;
+          uint32_t is_valid;
+
+          size_type const val_idx_in_block = cur_val_idx + idx;
+          if (s->page.page_type == PageType::DICTIONARY_PAGE) {
+            val_idx  = val_idx_in_block;
+            is_valid = (val_idx < s->page.num_leaf_values);
+            if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
+          } else {
+            size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
+
+            is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
+                        val_idx_in_block < s->page.num_leaf_values)
+                         ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
+                         : 0;
+            val_idx  = val_idx_in_leaf_col;
+          }
+          return std::make_tuple(is_valid, val_idx);
+        }();
+
+        if (is_valid) {
+          len = dtype_len_out;
+          if (type_id == type_id::STRING) {
+            len += s->col.leaf_column->element<string_view>(val_idx).size_bytes();
+          } else if (s->col.output_as_byte_array && type_id == type_id::LIST) {
+            len +=
+              get_element<statistics::byte_array_view>(*s->col.leaf_column, val_idx).size_bytes();
+          }
+
+          auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
+          uint32_t v       = len - 4;  // string length
+          encode_value(dst + lpos, v, 1);
+          // parallel memcpy
+          if (v != 0) { memcpy_block<block_size, true>(dst + lpos + 4, bytes, v, t); }
+          lpos += len;
+        }
+      }
+
+    } else {
+      // only PLAIN encoding is supported
+      if (is_valid) {
+        auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
+        uint32_t v       = len - 4;  // string length
+        encode_value(dst + pos, v, 1);
+        if (v != 0) memcpy(dst + pos + 4, bytes, v);
+      }
+    }
+
+    cur_val_idx += nvals;
+    __syncthreads();
+  }
+
   finish_page_encode<block_size>(
     s, s->cur, pages, comp_in, comp_out, comp_results, write_v2_headers);
 }
@@ -3533,6 +3638,13 @@ void EncodePages(device_span<EncPage> pages,
       pages, write_v2_headers, encode_kernel_mask::PLAIN);
     gpuEncodePages<encode_block_size><<<num_pages, encode_block_size, 0, strm.value()>>>(
       pages, comp_in, comp_out, comp_results, write_v2_headers, false);
+  }
+  if (BitAnd(kernel_mask, encode_kernel_mask::PLAIN_BYTE_ARRAY) != 0) {
+    auto const strm = streams[s_idx++];
+    gpuEncodePageLevels<encode_block_size><<<num_pages, encode_block_size, 0, strm.value()>>>(
+      pages, write_v2_headers, encode_kernel_mask::PLAIN_BYTE_ARRAY);
+    gpuEncodePlainStringPages<encode_block_size><<<num_pages, encode_block_size, 0, strm.value()>>>(
+      pages, comp_in, comp_out, comp_results, write_v2_headers);
   }
   if (BitAnd(kernel_mask, encode_kernel_mask::BYTE_STREAM_SPLIT) != 0) {
     auto const strm = streams[s_idx++];
