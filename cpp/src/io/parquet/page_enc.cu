@@ -1883,6 +1883,7 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
                             bool write_v2_headers)
 {
   __shared__ __align__(8) page_enc_state_s<0> state_g;
+  __shared__ uint32_t num_valid;
   using block_scan   = cub::BlockScan<uint32_t, block_size>;
   using block_reduce = cub::BlockReduce<uint32_t, block_size>;
   __shared__ typename block_scan::TempStorage scan_storage;
@@ -1928,30 +1929,44 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
   }
   __syncthreads();
 
+  auto get_valid_idx = [&](size_type val_idx_in_block) {
+    uint32_t val_idx;
+    uint32_t is_valid;
+
+    if (s->page.page_type == PageType::DICTIONARY_PAGE) {
+      val_idx  = val_idx_in_block;
+      is_valid = (val_idx < s->page.num_leaf_values);
+      if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
+    } else {
+      size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
+
+      is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
+                  val_idx_in_block < s->page.num_leaf_values)
+                   ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
+                   : 0;
+      val_idx  = val_idx_in_leaf_col;
+    }
+    return std::make_tuple(is_valid, val_idx);
+  };
+
+  auto const get_bytes = [](cudf::type_id const type_id,
+                            column_device_view const* leaf_column,
+                            uint32_t const val_idx) -> void const* {
+    switch (type_id) {
+      case type_id::STRING:
+        return reinterpret_cast<void const*>(leaf_column->element<string_view>(val_idx).data());
+      case type_id::LIST:
+        return reinterpret_cast<void const*>(
+          get_element<statistics::byte_array_view>(*(leaf_column), val_idx).data());
+      default: CUDF_UNREACHABLE("invalid type id for byte array writing!");
+    }
+  };
+
   for (uint32_t cur_val_idx = 0; cur_val_idx < s->page.num_leaf_values;) {
     uint32_t nvals = min(s->page.num_leaf_values - cur_val_idx, block_size);
     uint32_t len, pos;
 
-    auto [is_valid, val_idx] = [&]() {
-      uint32_t val_idx;
-      uint32_t is_valid;
-
-      size_type const val_idx_in_block = cur_val_idx + t;
-      if (s->page.page_type == PageType::DICTIONARY_PAGE) {
-        val_idx  = val_idx_in_block;
-        is_valid = (val_idx < s->page.num_leaf_values);
-        if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
-      } else {
-        size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
-
-        is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
-                    val_idx_in_block < s->page.num_leaf_values)
-                     ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
-                     : 0;
-        val_idx  = val_idx_in_leaf_col;
-      }
-      return std::make_tuple(is_valid, val_idx);
-    }();
+    auto [is_valid, val_idx] = get_valid_idx(cur_val_idx + t);
 
     // Non-dictionary encoding
     uint8_t* dst = s->cur;
@@ -1972,51 +1987,19 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
 
     if (t == 0) { s->cur = dst + total_len; }
 
-    __shared__ uint32_t num_valid;
     auto const valids = block_reduce(reduce_storage).Sum(is_valid);
     if (t == 0) { num_valid = valids; }
     __syncthreads();
 
-    bool const large_strings = ((total_len - num_valid * 4) / num_valid) > 32;
-
-    auto const get_bytes = [](cudf::type_id const type_id,
-                              column_device_view const* leaf_column,
-                              uint32_t const val_idx) -> void const* {
-      switch (type_id) {
-        case type_id::STRING:
-          return reinterpret_cast<void const*>(leaf_column->element<string_view>(val_idx).data());
-        case type_id::LIST:
-          return reinterpret_cast<void const*>(
-            get_element<statistics::byte_array_view>(*(leaf_column), val_idx).data());
-        default: CUDF_UNREACHABLE("invalid type id for byte array writing!");
-      }
-    };
+    // TODO: need to test to see what an appropriate cutoff is here
+    constexpr uint32_t large_strings_cutoff = 32;
+    bool const large_strings = ((total_len - num_valid * 4) / num_valid) > large_strings_cutoff;
 
     if (large_strings) {
-      // if (t==0) printf("large tot %d nv %d\n", total_len, num_valid);
-      //  for now duplicate
+      //  for now duplicate some effort
       uint32_t lpos = 0;
       for (int idx = 0; idx < nvals; idx++) {
-        auto [is_valid, val_idx] = [&]() {
-          uint32_t val_idx;
-          uint32_t is_valid;
-
-          size_type const val_idx_in_block = cur_val_idx + idx;
-          if (s->page.page_type == PageType::DICTIONARY_PAGE) {
-            val_idx  = val_idx_in_block;
-            is_valid = (val_idx < s->page.num_leaf_values);
-            if (is_valid) { val_idx = s->ck.dict_data[val_idx]; }
-          } else {
-            size_type const val_idx_in_leaf_col = s->page_start_val + val_idx_in_block;
-
-            is_valid = (val_idx_in_leaf_col < s->col.leaf_column->size() &&
-                        val_idx_in_block < s->page.num_leaf_values)
-                         ? s->col.leaf_column->is_valid(val_idx_in_leaf_col)
-                         : 0;
-            val_idx  = val_idx_in_leaf_col;
-          }
-          return std::make_tuple(is_valid, val_idx);
-        }();
+        auto [is_valid, val_idx] = get_valid_idx(cur_val_idx + idx);
 
         if (is_valid) {
           len = dtype_len_out;
@@ -2037,7 +2020,6 @@ CUDF_KERNEL void __launch_bounds__(block_size, 8)
       }
 
     } else {
-      // only PLAIN encoding is supported
       if (is_valid) {
         auto const bytes = get_bytes(type_id, s->col.leaf_column, val_idx);
         uint32_t v       = len - 4;  // string length
