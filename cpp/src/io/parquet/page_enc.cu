@@ -509,15 +509,16 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
     return encode_kernel_mask::DICTIONARY;
   }
 
-  auto const plain = col_desc->physical_type == BYTE_ARRAY ? encode_kernel_mask::PLAIN_BYTE_ARRAY
-                                                           : encode_kernel_mask::PLAIN;
+  auto const plain_encoding = col_desc->physical_type == BYTE_ARRAY
+                                ? encode_kernel_mask::PLAIN_BYTE_ARRAY
+                                : encode_kernel_mask::PLAIN;
 
   // next check for user requested encoding, but skip if user requested dictionary encoding
   // (if we could use the requested dict encoding, we'd have returned above)
   if (col_desc->requested_encoding != column_encoding::USE_DEFAULT and
       col_desc->requested_encoding != column_encoding::DICTIONARY) {
     switch (col_desc->requested_encoding) {
-      case column_encoding::PLAIN: return plain;
+      case column_encoding::PLAIN: return plain_encoding;
       case column_encoding::DELTA_BINARY_PACKED: return encode_kernel_mask::DELTA_BINARY;
       case column_encoding::DELTA_LENGTH_BYTE_ARRAY: return encode_kernel_mask::DELTA_LENGTH_BA;
       case column_encoding::DELTA_BYTE_ARRAY: return encode_kernel_mask::DELTA_BYTE_ARRAY;
@@ -538,7 +539,7 @@ __device__ encode_kernel_mask data_encoding_for_col(EncColumnChunk const* chunk,
     }
   }
 
-  return plain;
+  return plain_encoding;
 }
 
 __device__ size_t delta_data_len(Type physical_type,
