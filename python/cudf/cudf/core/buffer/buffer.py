@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 import numpy
 from typing_extensions import Self
 
+import pylibcudf
 import rmm
 
 import cudf
@@ -283,7 +284,7 @@ class BufferOwner(Serializable):
         """Read-only access to the buffer through host memory."""
         size = self._size if size is None else size
         host_buf = host_memory_allocation(size)
-        rmm._lib.device_buffer.copy_ptr_to_host(
+        rmm.pylibrmm.device_buffer.copy_ptr_to_host(
             self.get_ptr(mode="read") + offset, host_buf
         )
         return memoryview(host_buf).toreadonly()
@@ -501,7 +502,7 @@ def get_ptr_and_size(array_interface: Mapping) -> tuple[int, int]:
     shape = array_interface["shape"] or (1,)
     strides = array_interface["strides"]
     itemsize = cudf.dtype(array_interface["typestr"]).itemsize
-    if strides is None or cudf._lib.pylibcudf.column.is_c_contiguous(
+    if strides is None or pylibcudf.column.is_c_contiguous(
         shape, strides, itemsize
     ):
         nelem = math.prod(shape)

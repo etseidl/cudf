@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 #include <cudf/io/types.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/export.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -25,7 +26,7 @@
 #include <future>
 #include <memory>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 //! IO interfaces
 namespace io {
 
@@ -85,14 +86,28 @@ class datasource {
   /**
    * @brief Creates a source from a file path.
    *
+   * @note Parameters `offset`, `max_size_estimate` and `min_size_estimate` are hints to the
+   * `datasource` implementation about the expected range of the data that will be read. The
+   * implementation may use these hints to optimize the read operation. These parameters are usually
+   * based on the byte range option. In this case, `min_size_estimate` should be no greater than the
+   * byte range to avoid potential issues when reading adjacent ranges. `max_size_estimate` can
+   * include padding after the byte range, to include additional data that may be needed for
+   * processing.
+   *
+   @throws cudf::logic_error if the minimum size estimate is greater than the maximum size estimate
+   *
    * @param[in] filepath Path to the file to use
-   * @param[in] offset Bytes from the start of the file (the default is zero)
-   * @param[in] size Bytes from the offset; use zero for entire file (the default is zero)
+   * @param[in] offset Starting byte offset from which data will be read (the default is zero)
+   * @param[in] max_size_estimate Upper estimate of the data range that will be read (the default is
+   * zero, which means the whole file after `offset`)
+   * @param[in] min_size_estimate Lower estimate of the data range that will be read (the default is
+   * zero, which means the whole file after `offset`)
    * @return Constructed datasource object
    */
   static std::unique_ptr<datasource> create(std::string const& filepath,
-                                            size_t offset = 0,
-                                            size_t size   = 0);
+                                            size_t offset            = 0,
+                                            size_t max_size_estimate = 0,
+                                            size_t min_size_estimate = 0);
 
   /**
    * @brief Creates a source from a host memory buffer.
@@ -376,4 +391,4 @@ class datasource {
 
 /** @} */  // end of group
 }  // namespace io
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

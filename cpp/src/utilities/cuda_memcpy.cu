@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "cudf/detail/utilities/integer_utils.hpp"
+
+#include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
@@ -26,15 +29,24 @@ namespace cudf::detail {
 
 namespace {
 
+// Simple kernel to copy between device buffers
+CUDF_KERNEL void copy_kernel(char const* __restrict__ src, char* __restrict__ dst, size_t n)
+{
+  auto const idx = cudf::detail::grid_1d::global_thread_id();
+  if (idx < n) { dst[idx] = src[idx]; }
+}
+
 void copy_pinned(void* dst, void const* src, std::size_t size, rmm::cuda_stream_view stream)
 {
   if (size == 0) return;
 
   if (size < get_kernel_pinned_copy_threshold()) {
-    thrust::copy_n(rmm::exec_policy_nosync(stream),
-                   static_cast<const char*>(src),
-                   size,
-                   static_cast<char*>(dst));
+    const int block_size = 256;
+    auto const grid_size = cudf::util::div_rounding_up_safe<size_t>(size, block_size);
+    // We are explicitly launching the kernel here instead of calling a thrust function because the
+    // thrust function can potentially call cudaMemcpyAsync instead of using a kernel
+    copy_kernel<<<grid_size, block_size, 0, stream.value()>>>(
+      static_cast<char const*>(src), static_cast<char*>(dst), size);
   } else {
     CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream));
   }
@@ -49,7 +61,7 @@ void copy_pageable(void* dst, void const* src, std::size_t size, rmm::cuda_strea
 
 };  // namespace
 
-void cuda_memcpy_async(
+void cuda_memcpy_async_impl(
   void* dst, void const* src, size_t size, host_memory_kind kind, rmm::cuda_stream_view stream)
 {
   if (kind == host_memory_kind::PINNED) {
@@ -59,13 +71,6 @@ void cuda_memcpy_async(
   } else {
     CUDF_FAIL("Unsupported host memory kind");
   }
-}
-
-void cuda_memcpy(
-  void* dst, void const* src, size_t size, host_memory_kind kind, rmm::cuda_stream_view stream)
-{
-  cuda_memcpy_async(dst, src, size, kind, stream);
-  stream.synchronize();
 }
 
 }  // namespace cudf::detail

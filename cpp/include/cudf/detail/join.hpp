@@ -20,11 +20,11 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <cuco/static_multimap.cuh>
 
@@ -34,10 +34,10 @@
 
 // Forward declaration
 namespace cudf::experimental::row::equality {
-class preprocessed_table;
+class CUDF_EXPORT preprocessed_table;
 }
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace detail {
 
 constexpr int DEFAULT_JOIN_CG_SIZE = 2;
@@ -59,7 +59,7 @@ struct hash_join {
     cuco::static_multimap<hash_value_type,
                           cudf::size_type,
                           cuda::thread_scope_device,
-                          cudf::detail::cuco_allocator,
+                          cudf::detail::cuco_allocator<char>,
                           cuco::legacy::double_hashing<DEFAULT_JOIN_CG_SIZE, Hasher, Hasher>>;
 
   hash_join()                            = delete;
@@ -185,4 +185,4 @@ struct hash_join {
                     rmm::device_async_resource_ref mr) const;
 };
 }  // namespace detail
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

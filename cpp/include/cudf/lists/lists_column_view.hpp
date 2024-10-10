@@ -17,6 +17,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/utilities/export.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -25,7 +26,7 @@
  * @brief Class definition for cudf::lists_column_view
  */
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @addtogroup lists_classes
@@ -47,7 +48,7 @@ class lists_column_view : private column_view {
   lists_column_view(column_view const& lists_column);
   lists_column_view(lists_column_view&&)      = default;  ///< Move constructor
   lists_column_view(lists_column_view const&) = default;  ///< Copy constructor
-  ~lists_column_view()                        = default;
+  ~lists_column_view() override               = default;
   /**
    * @brief Copy assignment operator
    *
@@ -137,4 +138,4 @@ class lists_column_view : private column_view {
   }
 };
 /** @} */  // end of group
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

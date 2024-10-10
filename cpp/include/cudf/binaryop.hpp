@@ -18,13 +18,12 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/scalar/scalar.hpp>
-
-#include <rmm/mr/device/per_device_resource.hpp>
-#include <rmm/resource_ref.hpp>
+#include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <memory>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @addtogroup transformation_binaryops
@@ -170,7 +169,7 @@ std::unique_ptr<column> binary_operation(
   binary_operator op,
   data_type output_type,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a binary operation between a column and a scalar.
@@ -201,7 +200,7 @@ std::unique_ptr<column> binary_operation(
   binary_operator op,
   data_type output_type,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a binary operation between two columns.
@@ -231,7 +230,7 @@ std::unique_ptr<column> binary_operation(
   binary_operator op,
   data_type output_type,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a binary operation between two columns using a
@@ -262,7 +261,7 @@ std::unique_ptr<column> binary_operation(
   std::string const& ptx,
   data_type output_type,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Computes the `scale` for a `fixed_point` number based on given binary operator `op`
@@ -314,10 +313,15 @@ std::pair<rmm::device_buffer, size_type> scalar_col_valid_mask_and(
   column_view const& col,
   scalar const& s,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
-namespace compiled {
-namespace detail {
+}  // namespace binops
+
+/** @} */  // end of group
+}  // namespace CUDF_EXPORT cudf
+
+namespace CUDF_EXPORT cudf {
+namespace binops::compiled::detail {
 
 /**
  * @brief struct binary operation using `NaN` aware sorting physical element comparators
@@ -337,9 +341,5 @@ void apply_sorting_struct_binary_op(mutable_column_view& out,
                                     bool is_rhs_scalar,
                                     binary_operator op,
                                     rmm::cuda_stream_view stream);
-}  // namespace detail
-}  // namespace compiled
-}  // namespace binops
-
-/** @} */  // end of group
-}  // namespace cudf
+}  // namespace binops::compiled::detail
+}  // namespace CUDF_EXPORT cudf

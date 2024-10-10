@@ -18,16 +18,33 @@
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/table_utilities.hpp>
 
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/mr/device/pool_memory_resource.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
-#include <rmm/resource_ref.hpp>
 
-class PinnedMemoryTest : public cudf::test::BaseFixture {};
+class PinnedMemoryTest : public cudf::test::BaseFixture {
+  size_t prev_copy_threshold;
+  size_t prev_alloc_threshold;
 
-TEST(PinnedMemoryTest, MemoryResourceGetAndSet)
+ public:
+  PinnedMemoryTest()
+    : prev_copy_threshold{cudf::get_kernel_pinned_copy_threshold()},
+      prev_alloc_threshold{cudf::get_allocate_host_as_pinned_threshold()}
+  {
+  }
+  ~PinnedMemoryTest() override
+  {
+    cudf::set_kernel_pinned_copy_threshold(prev_copy_threshold);
+    cudf::set_allocate_host_as_pinned_threshold(prev_alloc_threshold);
+  }
+};
+
+TEST_F(PinnedMemoryTest, MemoryResourceGetAndSet)
 {
   // Global environment for temporary files
   auto const temp_env = static_cast<cudf::test::TempDirTestEnvironment*>(
@@ -62,4 +79,69 @@ TEST(PinnedMemoryTest, MemoryResourceGetAndSet)
 
   // reset memory resource back
   cudf::set_pinned_memory_resource(last_mr);
+}
+
+TEST_F(PinnedMemoryTest, KernelCopyThresholdGetAndSet)
+{
+  cudf::set_kernel_pinned_copy_threshold(12345);
+  EXPECT_EQ(cudf::get_kernel_pinned_copy_threshold(), 12345);
+}
+
+TEST_F(PinnedMemoryTest, HostAsPinnedThresholdGetAndSet)
+{
+  cudf::set_allocate_host_as_pinned_threshold(12345);
+  EXPECT_EQ(cudf::get_allocate_host_as_pinned_threshold(), 12345);
+}
+
+TEST_F(PinnedMemoryTest, MakePinnedVector)
+{
+  cudf::set_allocate_host_as_pinned_threshold(0);
+
+  // should always use pinned memory
+  {
+    auto const vec = cudf::detail::make_pinned_vector_async<char>(1, cudf::get_default_stream());
+    EXPECT_TRUE(vec.get_allocator().is_device_accessible());
+  }
+}
+
+TEST_F(PinnedMemoryTest, MakeHostVector)
+{
+  cudf::set_allocate_host_as_pinned_threshold(7);
+
+  // allocate smaller than the threshold
+  {
+    auto const vec = cudf::detail::make_host_vector<int32_t>(1, cudf::get_default_stream());
+    EXPECT_TRUE(vec.get_allocator().is_device_accessible());
+  }
+
+  // allocate the same size as the threshold
+  {
+    auto const vec = cudf::detail::make_host_vector<char>(7, cudf::get_default_stream());
+    EXPECT_TRUE(vec.get_allocator().is_device_accessible());
+  }
+
+  // allocate larger than the threshold
+  {
+    auto const vec = cudf::detail::make_host_vector<int32_t>(2, cudf::get_default_stream());
+    EXPECT_FALSE(vec.get_allocator().is_device_accessible());
+  }
+}
+
+TEST_F(PinnedMemoryTest, HostSpan)
+{
+  auto test_ctors = [](auto&& vec) {
+    auto const is_vec_device_accessible = vec.get_allocator().is_device_accessible();
+    // Test conversion from a vector
+    auto const span = cudf::host_span<int16_t>{vec};
+    EXPECT_EQ(span.is_device_accessible(), is_vec_device_accessible);
+    // Test conversion from host_span with different type
+    auto const span_converted = cudf::host_span<int16_t const>{span};
+    EXPECT_EQ(span_converted.is_device_accessible(), is_vec_device_accessible);
+  };
+
+  cudf::set_allocate_host_as_pinned_threshold(7);
+  for (int i = 1; i < 10; i++) {
+    // some iterations will use pinned memory, some will not
+    test_ctors(cudf::detail::make_host_vector<int16_t>(i, cudf::get_default_stream()));
+  }
 }

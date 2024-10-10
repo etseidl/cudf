@@ -31,12 +31,12 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <thrust/device_vector.h>
 #include <thrust/iterator/discard_iterator.h>
@@ -618,12 +618,14 @@ struct PdaSymbolToSymbolGroupId {
     constexpr auto pda_sgid_lookup_size =
       static_cast<int32_t>(sizeof(tos_sg_to_pda_sgid) / sizeof(tos_sg_to_pda_sgid[0]));
     // We map the delimiter character to LINE_BREAK symbol group id, and the newline character
-    // to OTHER. Note that delimiter cannot be any of opening(closing) brace, bracket, quote,
+    // to WHITE_SPACE. Note that delimiter cannot be any of opening(closing) brace, bracket, quote,
     // escape, comma, colon or whitespace characters.
+    auto constexpr newline    = '\n';
+    auto constexpr whitespace = ' ';
     auto const symbol_position =
       symbol == delimiter
-        ? static_cast<int32_t>('\n')
-        : (symbol == '\n' ? static_cast<int32_t>(delimiter) : static_cast<int32_t>(symbol));
+        ? static_cast<int32_t>(newline)
+        : (symbol == newline ? static_cast<int32_t>(whitespace) : static_cast<int32_t>(symbol));
     PdaSymbolGroupIdT symbol_gid =
       tos_sg_to_pda_sgid[min(symbol_position, pda_sgid_lookup_size - 1)];
     return stack_idx * static_cast<PdaSymbolGroupIdT>(symbol_group_id::NUM_PDA_INPUT_SGS) +
@@ -1455,11 +1457,14 @@ void get_stack_context(device_span<SymbolT const> json_in,
   constexpr auto max_translation_table_size =
     to_stack_op::NUM_SYMBOL_GROUPS * to_stack_op::TT_NUM_STATES;
 
-  auto json_to_stack_ops_fst = fst::detail::make_fst(
+  static constexpr auto min_translated_out = 0;
+  static constexpr auto max_translated_out = 1;
+  auto json_to_stack_ops_fst               = fst::detail::make_fst(
     fst::detail::make_symbol_group_lut(to_stack_op::get_sgid_lut(delimiter)),
     fst::detail::make_transition_table(to_stack_op::get_transition_table(stack_behavior)),
-    fst::detail::make_translation_table<max_translation_table_size>(
-      to_stack_op::get_translation_table(stack_behavior)),
+    fst::detail::
+      make_translation_table<max_translation_table_size, min_translated_out, max_translated_out>(
+        to_stack_op::get_translation_table(stack_behavior)),
     stream);
 
   // "Search" for relevant occurrence of brackets and braces that indicate the beginning/end
@@ -1507,13 +1512,14 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> pr
   // Instantiate FST for post-processing the token stream to remove all tokens that belong to an
   // invalid JSON line
   token_filter::UnwrapTokenFromSymbolOp sgid_op{};
-  auto filter_fst =
-    fst::detail::make_fst(fst::detail::make_symbol_group_lut(token_filter::symbol_groups, sgid_op),
-                          fst::detail::make_transition_table(token_filter::transition_table),
-                          fst::detail::make_translation_functor(token_filter::TransduceToken{}),
-                          stream);
+  using symbol_t  = thrust::tuple<PdaTokenT, SymbolOffsetT>;
+  auto filter_fst = fst::detail::make_fst(
+    fst::detail::make_symbol_group_lut(token_filter::symbol_groups, sgid_op),
+    fst::detail::make_transition_table(token_filter::transition_table),
+    fst::detail::make_translation_functor<symbol_t, 0, 2>(token_filter::TransduceToken{}),
+    stream);
 
-  auto const mr = rmm::mr::get_current_device_resource();
+  auto const mr = cudf::get_current_device_resource_ref();
   rmm::device_scalar<SymbolOffsetT> d_num_selected_tokens(stream, mr);
   rmm::device_uvector<PdaTokenT> filtered_tokens_out{tokens.size(), stream, mr};
   rmm::device_uvector<SymbolOffsetT> filtered_token_indices_out{tokens.size(), stream, mr};
@@ -1598,7 +1604,8 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> ge
       fst::detail::make_symbol_group_lookup_op(
         fix_stack_of_excess_chars::SymbolPairToSymbolGroupId{delimiter}),
       fst::detail::make_transition_table(fix_stack_of_excess_chars::transition_table),
-      fst::detail::make_translation_functor(fix_stack_of_excess_chars::TransduceInputOp{}),
+      fst::detail::make_translation_functor<StackSymbolT, 1, 1>(
+        fix_stack_of_excess_chars::TransduceInputOp{}),
       stream);
     fix_stack_of_excess_chars.Transduce(zip_in,
                                         static_cast<SymbolOffsetT>(json_in.size()),
@@ -1619,7 +1626,7 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> ge
   auto json_to_tokens_fst = fst::detail::make_fst(
     fst::detail::make_symbol_group_lookup_op(tokenizer_pda::PdaSymbolToSymbolGroupId{delimiter}),
     fst::detail::make_transition_table(tokenizer_pda::get_transition_table(format)),
-    fst::detail::make_translation_table<max_translation_table_size>(
+    fst::detail::make_translation_table<max_translation_table_size, 0, 3>(
       tokenizer_pda::get_translation_table(recover_from_error)),
     stream);
 
@@ -1655,6 +1662,7 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> ge
 
   if (delimiter_offset == 1) {
     tokens.set_element(0, token_t::LineEnd, stream);
+    validate_token_stream(json_in, tokens, tokens_indices, options, stream);
     auto [filtered_tokens, filtered_tokens_indices] =
       process_token_stream(tokens, tokens_indices, stream);
     tokens         = std::move(filtered_tokens);
@@ -1698,10 +1706,8 @@ void make_json_column(json_column& root_column,
   auto const [d_tokens_gpu, d_token_indices_gpu] = get_token_stream(d_input, options, stream, mr);
 
   // Copy the JSON tokens to the host
-  thrust::host_vector<PdaTokenT> tokens =
-    cudf::detail::make_host_vector_async(d_tokens_gpu, stream);
-  thrust::host_vector<SymbolOffsetT> token_indices_gpu =
-    cudf::detail::make_host_vector_async(d_token_indices_gpu, stream);
+  auto tokens            = cudf::detail::make_host_vector_async(d_tokens_gpu, stream);
+  auto token_indices_gpu = cudf::detail::make_host_vector_async(d_token_indices_gpu, stream);
 
   // Make sure tokens have been copied to the host
   stream.synchronize();
@@ -2075,11 +2081,15 @@ cudf::io::parse_options parsing_options(cudf::io::json_reader_options const& opt
 {
   auto parse_opts = cudf::io::parse_options{',', '\n', '\"', '.'};
 
-  parse_opts.dayfirst   = options.is_enabled_dayfirst();
-  parse_opts.keepquotes = options.is_enabled_keep_quotes();
-  parse_opts.trie_true  = cudf::detail::create_serialized_trie({"true"}, stream);
-  parse_opts.trie_false = cudf::detail::create_serialized_trie({"false"}, stream);
-  parse_opts.trie_na    = cudf::detail::create_serialized_trie({"", "null"}, stream);
+  parse_opts.dayfirst              = options.is_enabled_dayfirst();
+  parse_opts.keepquotes            = options.is_enabled_keep_quotes();
+  parse_opts.normalize_whitespace  = options.is_enabled_normalize_whitespace();
+  parse_opts.mixed_types_as_string = options.is_enabled_mixed_types_as_string();
+  parse_opts.trie_true             = cudf::detail::create_serialized_trie({"true"}, stream);
+  parse_opts.trie_false            = cudf::detail::create_serialized_trie({"false"}, stream);
+  std::vector<std::string> na_values{"", "null"};
+  na_values.insert(na_values.end(), options.get_na_values().begin(), options.get_na_values().end());
+  parse_opts.trie_na = cudf::detail::create_serialized_trie(na_values, stream);
   return parse_opts;
 }
 
@@ -2122,10 +2132,10 @@ std::pair<std::unique_ptr<column>, std::vector<column_name_info>> json_column_to
       // Move string_offsets and string_lengths to GPU
       rmm::device_uvector<json_column::row_offset_t> d_string_offsets =
         cudf::detail::make_device_uvector_async(
-          json_col.string_offsets, stream, rmm::mr::get_current_device_resource());
+          json_col.string_offsets, stream, cudf::get_current_device_resource_ref());
       rmm::device_uvector<json_column::row_offset_t> d_string_lengths =
         cudf::detail::make_device_uvector_async(
-          json_col.string_lengths, stream, rmm::mr::get_current_device_resource());
+          json_col.string_lengths, stream, cudf::get_current_device_resource_ref());
 
       // Prepare iterator that returns (string_offset, string_length)-tuples
       auto offset_length_it =

@@ -35,12 +35,13 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
-
-#include <rmm/resource_ref.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <algorithm>
+#include <utility>
 
 namespace cudf::io {
+
 // Returns builder for csv_reader_options
 csv_reader_options_builder csv_reader_options::builder(source_info src)
 {
@@ -121,14 +122,16 @@ chunked_parquet_writer_options_builder chunked_parquet_writer_options::builder(
 namespace {
 
 std::vector<std::unique_ptr<cudf::io::datasource>> make_datasources(source_info const& info,
-                                                                    size_t range_offset = 0,
-                                                                    size_t range_size   = 0)
+                                                                    size_t offset            = 0,
+                                                                    size_t max_size_estimate = 0,
+                                                                    size_t min_size_estimate = 0)
 {
   switch (info.type()) {
     case io_type::FILEPATH: {
       auto sources = std::vector<std::unique_ptr<cudf::io::datasource>>();
       for (auto const& filepath : info.filepaths()) {
-        sources.emplace_back(cudf::io::datasource::create(filepath, range_offset, range_size));
+        sources.emplace_back(
+          cudf::io::datasource::create(filepath, offset, max_size_estimate, min_size_estimate));
       }
       return sources;
     }
@@ -210,7 +213,8 @@ table_with_metadata read_json(json_reader_options options,
 
   auto datasources = make_datasources(options.get_source(),
                                       options.get_byte_range_offset(),
-                                      options.get_byte_range_size_with_padding());
+                                      options.get_byte_range_size_with_padding(),
+                                      options.get_byte_range_size());
 
   return json::detail::read_json(datasources, options, stream, mr);
 }
@@ -237,7 +241,8 @@ table_with_metadata read_csv(csv_reader_options options,
 
   auto datasources = make_datasources(options.get_source(),
                                       options.get_byte_range_offset(),
-                                      options.get_byte_range_size_with_padding());
+                                      options.get_byte_range_size_with_padding(),
+                                      options.get_byte_range_size());
 
   CUDF_EXPECTS(datasources.size() == 1, "Only a single source is currently supported.");
 
@@ -472,6 +477,8 @@ chunked_orc_reader::chunked_orc_reader(std::size_t chunk_read_limit,
 {
 }
 
+chunked_orc_reader::chunked_orc_reader() = default;
+
 // This destructor destroys the internal reader instance.
 // Since the declaration of the internal `reader` object does not exist in the header, this
 // destructor needs to be defined in a separate source file which can access to that object's
@@ -491,6 +498,10 @@ table_with_metadata chunked_orc_reader::read_chunk() const
   CUDF_EXPECTS(reader != nullptr, "Reader has not been constructed properly.");
   return reader->read_chunk();
 }
+
+orc_chunked_writer::orc_chunked_writer() = default;
+
+orc_chunked_writer::~orc_chunked_writer() = default;
 
 /**
  * @copydoc cudf::io::orc_chunked_writer::orc_chunked_writer
@@ -618,6 +629,8 @@ std::unique_ptr<std::vector<uint8_t>> write_parquet(parquet_writer_options const
   return writer->close(options.get_column_chunks_file_paths());
 }
 
+chunked_parquet_reader::chunked_parquet_reader() = default;
+
 /**
  * @copydoc cudf::io::chunked_parquet_reader::chunked_parquet_reader
  */
@@ -672,6 +685,8 @@ table_with_metadata chunked_parquet_reader::read_chunk() const
   return reader->read_chunk();
 }
 
+parquet_chunked_writer::parquet_chunked_writer() = default;
+
 /**
  * @copydoc cudf::io::parquet_chunked_writer::parquet_chunked_writer
  */
@@ -685,6 +700,8 @@ parquet_chunked_writer::parquet_chunked_writer(chunked_parquet_writer_options co
   writer = std::make_unique<detail_parquet::writer>(
     std::move(sinks), options, io_detail::single_write_mode::NO, stream);
 }
+
+parquet_chunked_writer::~parquet_chunked_writer() = default;
 
 /**
  * @copydoc cudf::io::parquet_chunked_writer::write
@@ -840,8 +857,8 @@ void parquet_writer_options_base::set_sorting_columns(std::vector<sorting_column
   _sorting_columns = std::move(sorting_columns);
 }
 
-parquet_writer_options::parquet_writer_options(sink_info const& sink, table_view const& table)
-  : parquet_writer_options_base(sink), _table(table)
+parquet_writer_options::parquet_writer_options(sink_info const& sink, table_view table)
+  : parquet_writer_options_base(sink), _table(std::move(table))
 {
 }
 

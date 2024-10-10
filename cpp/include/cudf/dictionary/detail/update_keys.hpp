@@ -19,14 +19,13 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/resource_ref.hpp>
 
-namespace cudf {
-namespace dictionary {
-namespace detail {
+namespace CUDF_EXPORT cudf {
+namespace dictionary::detail {
 /**
  * @copydoc cudf::dictionary::add_keys(dictionary_column_view const&,column_view
  * const&,rmm::device_async_resource_ref)
@@ -103,6 +102,5 @@ std::vector<std::unique_ptr<column>> match_dictionaries(
 std::pair<std::vector<std::unique_ptr<column>>, std::vector<table_view>> match_dictionaries(
   std::vector<table_view> tables, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
 
-}  // namespace detail
-}  // namespace dictionary
-}  // namespace cudf
+}  // namespace dictionary::detail
+}  // namespace CUDF_EXPORT cudf

@@ -342,6 +342,10 @@ _reftarget_aliases = {
     "cudf.Series": ("cudf.core.series.Series", "cudf.Series"),
     "cudf.Index": ("cudf.core.index.Index", "cudf.Index"),
     "cupy.core.core.ndarray": ("cupy.ndarray", "cupy.ndarray"),
+    # TODO: Replace the first entry in a follow-up with rmm.pylibrmm.device_buffer.DeviceBuffer
+    # when the RMM objects inventory is generated from branch-24.12. The RMM objects inventory
+    # can be accessed here : https://docs.rapids.ai/api/rmm/nightly/objects.inv
+    "DeviceBuffer": ("rmm.DeviceBuffer", "rmm.DeviceBuffer"),
 }
 
 
@@ -383,6 +387,7 @@ _names_to_skip_in_pylibcudf = {
     # Cython types that don't alias cleanly because of
     # https://github.com/cython/cython/issues/5609
     "size_type",
+    "size_t",
     "type_id",
     # Unknown base types
     "int32_t",
@@ -556,9 +561,24 @@ nitpick_ignore = [
     ("py:class", "Dtype"),
     # The following are erroneously warned due to
     # https://github.com/sphinx-doc/sphinx/issues/11225
+    ("py:obj", "cudf.DatetimeIndex.time"),
+    ("py:obj", "cudf.DatetimeIndex.date"),
+    ("py:obj", "cudf.Index.values_host"),
+    ("py:obj", "cudf.Index.transpose"),
+    ("py:obj", "cudf.Index.T"),
+    ("py:obj", "cudf.Index.to_flat_index"),
+    ("py:obj", "cudf.MultiIndex.to_flat_index"),
+    ("py:meth", "pyarrow.Table.to_pandas"),
+    ("py:class", "pd.DataFrame"),
+    ("py:class", "pandas.core.indexes.frozen.FrozenList"),
     ("py:class", "pa.Array"),
     ("py:class", "ScalarLike"),
     ("py:class", "ParentType"),
+    ("py:class", "pyarrow.lib.DataType"),
+    ("py:class", "pyarrow.lib.Table"),
+    ("py:class", "pyarrow.lib.Scalar"),
+    ("py:class", "pyarrow.lib.ChunkedArray"),
+    ("py:class", "pyarrow.lib.Array"),
     ("py:class", "ColumnLike"),
     # TODO: Remove this when we figure out why typing_extensions doesn't seem
     # to map types correctly for intersphinx

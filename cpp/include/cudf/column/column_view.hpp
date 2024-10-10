@@ -31,8 +31,7 @@
  * @file column_view.hpp
  * @brief column view class definitions
  */
-
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace detail {
 /**
  * @brief A non-owning, immutable view of device data as a column of elements,
@@ -236,7 +235,7 @@ class column_view_base {
    *
    * @return Typed pointer to underlying data
    */
-  virtual void const* get_data() const noexcept { return _data; }
+  [[nodiscard]] virtual void const* get_data() const noexcept { return _data; }
 
   data_type _type{type_id::EMPTY};   ///< Element type
   size_type _size{};                 ///< Number of elements
@@ -296,6 +295,7 @@ class column_view_base {
                    size_type null_count,
                    size_type offset = 0);
 };
+
 }  // namespace detail
 
 /**
@@ -695,7 +695,7 @@ class mutable_column_view : public detail::column_view_base {
    *
    * @return Typed pointer to underlying data
    */
-  void const* get_data() const noexcept override;
+  [[nodiscard]] void const* get_data() const noexcept override;
 
  private:
   friend mutable_column_view bit_cast(mutable_column_view const& input, data_type type);
@@ -797,5 +797,6 @@ std::size_t shallow_hash(column_view const& input);
  * @return If `lhs` and `rhs` have equivalent shallow state
  */
 bool is_shallow_equivalent(column_view const& lhs, column_view const& rhs);
+
 }  // namespace detail
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

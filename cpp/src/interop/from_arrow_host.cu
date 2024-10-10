@@ -28,20 +28,20 @@
 #include <cudf/detail/unary.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/interop.hpp>
-#include <cudf/interop/detail/arrow.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
+#include <nanoarrow/nanoarrow_device.h>
 
 namespace cudf {
 namespace detail {
